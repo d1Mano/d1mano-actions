@@ -109,9 +109,9 @@ jobs:
           done
           case "$STATE" in
             Running|Available)
-              bash rpc.sh running started "{\"p_codespace_name\":\"$NAME\"}" ;;
+              bash rpc.sh running started "\"p_codespace_name\":\"$NAME\"" ;;
             *)
-              bash rpc.sh stopped start_failed "{\"p_codespace_name\":\"$NAME\",\"p_final_state\":\"$STATE\"}"
+              bash rpc.sh stopped start_failed "\"p_codespace_name\":\"$NAME\",\"p_final_state\":\"$STATE\""
               exit 1 ;;
           esac
 
@@ -127,7 +127,7 @@ jobs:
           if [ -n "$NAME" ]; then
             echo "Parando $NAME…"
             gh api -X POST "$API/user/codespaces/$NAME/stop" >/dev/null
-            bash rpc.sh stopped stopped "{\"p_codespace_name\":\"$NAME\"}"
+            bash rpc.sh stopped stopped "\"p_codespace_name\":\"$NAME\""
           else
             echo "No hay Codespace que parar."
             bash rpc.sh stopped stopped_noop
