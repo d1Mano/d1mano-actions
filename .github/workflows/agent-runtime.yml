@@ -54,14 +54,14 @@ jobs:
 
       - name: Actualizar repo dentro del codespace
         run: |
-          # En SSH no interactivo no hay credencial helper: fetch con token por
-          # env del ssh (-e, no se imprime) y reset al origin. La fuente de
-          # verdad del workspace es el repo; los untracked del codespace no se tocan.
-          gh codespace ssh -c "${{ steps.cs.outputs.name }}" -e PULL_TOKEN="${{ secrets.CODESPACES_TOKEN }}" -- \
-            'cd /workspaces/d1mano-automation && \
+          # gh codespace ssh no soporta --env en esta versión: el token va por
+          # stdin (read) y se interpola solo dentro del codespace.
+          printf '%s' "${{ secrets.CODESPACES_TOKEN }}" | \
+          gh codespace ssh -c "${{ steps.cs.outputs.name }}" -- \
+            'read -r PULL_TOKEN; cd /workspaces/d1mano-automation && \
              git fetch -q https://x-access-token:$PULL_TOKEN@github.com/d1Mano/d1mano-automation.git main && \
              git reset --hard FETCH_HEAD >/dev/null && \
-             echo "repo actualizado: $(git log -1 --format=%h %s)"'
+             echo "repo actualizado: $(git log -1 --format=%h)"'
 
       - name: Ejecutar acción sobre el runtime
         run: |
