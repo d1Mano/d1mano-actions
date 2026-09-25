@@ -1,0 +1,80 @@
+name: agent-runtime
+
+# Fase 5/7 — control del runtime del agente DENTRO del Codespace:
+#   start (--selftest) | status | stop | selftest
+# Ejecuta agent/agent_ctl.py vía `gh codespace ssh`. El codespace debe
+# estar activo (usar manage-workspace action=start antes).
+#
+# Secrets: CODESPACES_TOKEN (PAT de la cuenta dueña, scopes codespace+repo).
+# Las credenciales de Supabase llegan al codespace como user secrets de
+# Codespaces (NO como secrets de este repo ni por SSH manual).
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Acción: start | status | stop | selftest"
+        required: true
+        default: "status"
+        type: string
+      workspace:
+        description: "Nombre del Codespace (opcional; si no, el primero del repo)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ secrets.CODESPACES_TOKEN }}
+  WORKSPACE_REPO: d1Mano/d1mano-automation
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Resolver codespace
+        id: cs
+        run: |
+          NAME="${{ inputs.workspace }}"
+          if [ -z "$NAME" ]; then
+            NAME=$(gh api "repos/$WORKSPACE_REPO/codespaces" --jq '.codespaces[0].name // empty')
+          fi
+          if [ -z "$NAME" ]; then
+            echo "::error::no hay codespace; lanza manage-workspace action=start"
+            exit 1
+          fi
+          STATE=$(gh api "user/codespaces/$NAME" --jq .state)
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+          echo "codespace: $NAME ($STATE)"
+
+      - name: Actualizar repo dentro del codespace
+        run: |
+          gh codespace ssh -c "${{ steps.cs.outputs.name }}" -- \
+            'cd /workspaces/d1mano-automation && git pull --ff-only 2>&1 | tail -1'
+
+      - name: Ejecutar acción sobre el runtime
+        run: |
+          ACTION="${{ inputs.action }}"
+          case "$ACTION" in
+            start|selftest)
+              # selftest = validación completa sin bot; start = bridge real (requiere token en system_config)
+              if [ "$ACTION" = "selftest" ]; then EXTRA="--selftest"; else EXTRA=""; fi
+              gh codespace ssh -c "${{ steps.cs.outputs.name }}" -- \
+                "cd /workspaces/d1mano-automation && python3 agent/agent_ctl.py start $EXTRA"
+              ;;
+            status)
+              gh codespace ssh -c "${{ steps.cs.outputs.name }}" -- \
+                'cd /workspaces/d1mano-automation && python3 agent/agent_ctl.py status'
+              ;;
+            stop)
+              gh codespace ssh -c "${{ steps.cs.outputs.name }}" -- \
+                'cd /workspaces/d1mano-automation && python3 agent/agent_ctl.py stop'
+              ;;
+            *)
+              echo "::error::acción desconocida: $ACTION"; exit 1 ;;
+          esac
