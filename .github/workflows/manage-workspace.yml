@@ -9,7 +9,7 @@ name: manage-workspace
 # Secrets requeridos (Settings → Secrets de este repo):
 #   CODESPACES_TOKEN     PAT de la cuenta colaboradora (scopes codespace + repo)
 #   SUPABASE_URL         URL del proyecto d1Mano
-#   SUPABASE_SERVICE_KEY service key (RPC agent_control.workspace_set_status)
+#   SUPABASE_SERVICE_KEY service key (RPC public.workspace_set_status)
 
 on:
   workflow_dispatch:
@@ -46,16 +46,18 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: RPC helper (estado en Supabase)
+      - name: Preparar helper RPC (persiste como archivo entre steps)
         run: |
-          rpc() { # <status> <event> [extra json]
-            curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/workspace_set_status" \
-              -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-              -H "Content-Type: application/json" \
-              -d "{\"p_workspace\":\"${{ inputs.workspace_id }}\",\"p_status\":\"$1\",\"p_event\":\"$2\"${3:+,$3}}" \
-              || echo "::warning::sin estado en Supabase (revisa secrets SUPABASE_*)"
-          }
-          echo "rpc() definida"
+          cat > rpc.sh <<'EOF'
+          #!/usr/bin/env bash
+          # usage: rpc.sh <status> <event> [extra-json]
+          STATUS="$1"; EVENT="$2"; EXTRA="${3:-}"
+          curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/workspace_set_status" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"p_workspace\":\"${{ inputs.workspace_id }}\",\"p_status\":\"$STATUS\",\"p_event\":\"$EVENT\"${EXTRA:+,$EXTRA}}" \
+            || echo "::warning::sin estado en Supabase (revisa secrets SUPABASE_*)"
+          EOF
 
       - name: Listar Codespaces del workspace
         if: inputs.action == 'list'
@@ -77,7 +79,7 @@ jobs:
       - name: Arrancar workspace
         if: inputs.action == 'start'
         run: |
-          rpc starting start_requested
+          bash rpc.sh starting start_requested
           NAME="${{ inputs.workspace }}"
           if [ -z "$NAME" ]; then
             NAME=$(gh api "$API/repos/$WORKSPACE_REPO/codespaces" \
@@ -107,16 +109,16 @@ jobs:
           done
           case "$STATE" in
             Running|Available)
-              rpc running started "{\"p_codespace_name\":\"$NAME\"}" ;;
+              bash rpc.sh running started "{\"p_codespace_name\":\"$NAME\"}" ;;
             *)
-              rpc stopped start_failed "{\"p_codespace_name\":\"$NAME\",\"p_final_state\":\"$STATE\"}"
+              bash rpc.sh stopped start_failed "{\"p_codespace_name\":\"$NAME\",\"p_final_state\":\"$STATE\"}"
               exit 1 ;;
           esac
 
       - name: Parar workspace
         if: inputs.action == 'stop'
         run: |
-          rpc stopping stop_requested
+          bash rpc.sh stopping stop_requested
           NAME="${{ inputs.workspace }}"
           if [ -z "$NAME" ]; then
             NAME=$(gh api "$API/repos/$WORKSPACE_REPO/codespaces" \
@@ -125,8 +127,8 @@ jobs:
           if [ -n "$NAME" ]; then
             echo "Parando $NAME…"
             gh api -X POST "$API/user/codespaces/$NAME/stop" >/dev/null
-            rpc stopped stopped "{\"p_codespace_name\":\"$NAME\"}"
+            bash rpc.sh stopped stopped "{\"p_codespace_name\":\"$NAME\"}"
           else
             echo "No hay Codespace que parar."
-            rpc stopped stopped_noop
+            bash rpc.sh stopped stopped_noop
           fi
