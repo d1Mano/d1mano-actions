@@ -1,13 +1,15 @@
 name: manage-workspace
 
-# Fase 3 — gestión del Codespace del workspace:
+# Fase 3 — gestión del Codespace del workspace + estado en Supabase:
 #   localizar / arrancar / parar / estado, vía GitHub REST API.
-# El Codespace se crea sobre WORKSPACE_REPO (donde vive el devcontainer),
-# no sobre este repo orquestador.
+# El Codespace se crea sobre WORKSPACE_REPO (donde vive el devcontainer).
+# Cada transición se registra en agent_control.workspaces (RPC service) para
+# que la app conozca el estado sin entrar a Actions.
 #
-# Requiere secret CODESPACES_TOKEN: PAT de la cuenta colaboradora dueña del
-# Codespace, con scopes `codespace` + `repo` (d1mano-automation es privado).
-# El token NUNCA se commitea; se configura en Settings → Secrets del repo.
+# Secrets requeridos (Settings → Secrets de este repo):
+#   CODESPACES_TOKEN     PAT de la cuenta colaboradora (scopes codespace + repo)
+#   SUPABASE_URL         URL del proyecto d1Mano
+#   SUPABASE_SERVICE_KEY service key (RPC agent_control.workspace_set_status)
 
 on:
   workflow_dispatch:
@@ -17,8 +19,13 @@ on:
         required: true
         default: "status"
         type: string
+      workspace_id:
+        description: "Fila en Supabase (workspace-a | workspace-b)"
+        required: false
+        default: "workspace-a"
+        type: string
       workspace:
-        description: "Nombre del Codespace (opcional; si no, usa el primero del repo)"
+        description: "Nombre del Codespace (opcional; si no, el primero del repo)"
         required: false
         default: ""
         type: string
@@ -30,13 +37,26 @@ env:
   GH_TOKEN: ${{ secrets.CODESPACES_TOKEN }}
   API: https://api.github.com
   WORKSPACE_REPO: d1Mano/d1mano-automation
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
 jobs:
   workspace:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
+      - name: RPC helper (estado en Supabase)
+        run: |
+          rpc() { # <status> <event> [extra json]
+            curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/workspace_set_status" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"p_workspace\":\"${{ inputs.workspace_id }}\",\"p_status\":\"$1\",\"p_event\":\"$2\"${3:+,$3}}" \
+              || echo "::warning::sin estado en Supabase (revisa secrets SUPABASE_*)"
+          }
+          echo "rpc() definida"
+
       - name: Listar Codespaces del workspace
         if: inputs.action == 'list'
         run: |
@@ -57,6 +77,7 @@ jobs:
       - name: Arrancar workspace
         if: inputs.action == 'start'
         run: |
+          rpc starting start_requested
           NAME="${{ inputs.workspace }}"
           if [ -z "$NAME" ]; then
             NAME=$(gh api "$API/repos/$WORKSPACE_REPO/codespaces" \
@@ -64,19 +85,33 @@ jobs:
           fi
           if [ -z "$NAME" ]; then
             echo "No hay Codespace: creando uno sobre $WORKSPACE_REPO…"
-            gh api -X POST "$API/repos/$WORKSPACE_REPO/codespaces" \
-              -f machine=basicLinux32gb \
-              -f branch=main \
-              --jq '{name, state, machine: .machine.display_name}'
+            CREATED=$(gh api -X POST "$API/repos/$WORKSPACE_REPO/codespaces" \
+              -f machine=basicLinux32gb -f branch=main)
+            NAME=$(echo "$CREATED" | jq -r .name)
           else
             echo "Arrancando $NAME…"
-            gh api -X POST "$API/user/codespaces/$NAME/start" \
-              --jq '{name, state}'
+            gh api -X POST "$API/user/codespaces/$NAME/start" >/dev/null
+          fi
+          # Esperar a running (máx ~5 min)
+          STATE=""
+          for i in $(seq 1 15); do
+            sleep 20
+            STATE=$(gh api "$API/user/codespaces/$NAME" --jq .state)
+            echo "  [$i] $NAME = $STATE"
+            [ "$STATE" = "Running" ] && break
+            [ "$STATE" = "Failed" ] && break
+          done
+          if [ "$STATE" = "Running" ]; then
+            rpc running started "{\"p_codespace_name\":\"$NAME\"}"
+          else
+            rpc stopped start_failed "{\"p_codespace_name\":\"$NAME\",\"p_final_state\":\"$STATE\"}"
+            exit 1
           fi
 
       - name: Parar workspace
         if: inputs.action == 'stop'
         run: |
+          rpc stopping stop_requested
           NAME="${{ inputs.workspace }}"
           if [ -z "$NAME" ]; then
             NAME=$(gh api "$API/repos/$WORKSPACE_REPO/codespaces" \
@@ -84,7 +119,9 @@ jobs:
           fi
           if [ -n "$NAME" ]; then
             echo "Parando $NAME…"
-            gh api -X POST "$API/user/codespaces/$NAME/stop" --jq '{name, state}'
+            gh api -X POST "$API/user/codespaces/$NAME/stop" >/dev/null
+            rpc stopped stopped "{\"p_codespace_name\":\"$NAME\"}"
           else
             echo "No hay Codespace que parar."
+            rpc stopped stopped_noop
           fi
