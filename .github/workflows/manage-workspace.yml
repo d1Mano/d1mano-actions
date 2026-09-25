@@ -125,6 +125,33 @@ jobs:
               exit 1 ;;
           esac
 
+      - name: Desplegar runtime dentro del codespace (start)
+        if: inputs.action == 'start'
+        run: |
+          NAME="${{ inputs.workspace }}"
+          if [ -z "$NAME" ]; then
+            NAME=$(gh api "$API/repos/$WORKSPACE_REPO/codespaces" --jq '.codespaces[0].name // empty')
+          fi
+          if [ -z "$NAME" ]; then
+            echo "::error::sin codespace para desplegar runtime"; exit 1
+          fi
+          # 1) repo al día dentro del codespace (fetch con token A: solo lectura)
+          printf '%s' "${{ secrets.CODESPACES_TOKEN }}" | \
+          gh codespace ssh -c "$NAME" -- \
+            'read -r PULL_TOKEN; cd /workspaces/d1mano-automation && \
+             git fetch -q https://x-access-token:$PULL_TOKEN@github.com/d1Mano/d1mano-automation.git main && \
+             git reset --hard FETCH_HEAD >/dev/null && echo "repo: $(git log -1 --format=%h)"'
+          # 2) credenciales runtime (.env.runtime, gitignored, 600)
+          printf 'SUPABASE_URL=%s\nSUPABASE_SERVICE_KEY=%s\nWORKSPACE_ID=%s\nGH_BILLING_TOKEN_A=%s\nGH_BILLING_TOKEN_B=%s\n' \
+            "${{ secrets.SUPABASE_URL }}" "${{ secrets.SUPABASE_SERVICE_KEY }}" \
+            "${{ inputs.workspace_id }}" "${{ secrets.BILLING_TOKEN_A }}" "${{ secrets.BILLING_TOKEN_B }}" | \
+          gh codespace ssh -c "$NAME" -- \
+            'cat > /workspaces/d1mano-automation/.env.runtime && \
+             chmod 600 /workspaces/d1mano-automation/.env.runtime && echo env OK'
+          # 3) bridge + opencode (tolera estar ya corriendo)
+          gh codespace ssh -c "$NAME" -- \
+            'cd /workspaces/d1mano-automation && python3 agent/agent_ctl.py start'
+
       - name: Parar workspace
         if: inputs.action == 'stop'
         run: |
