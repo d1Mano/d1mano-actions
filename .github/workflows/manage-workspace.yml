@@ -89,24 +89,29 @@ jobs:
               -f machine=basicLinux32gb -f branch=main)
             NAME=$(echo "$CREATED" | jq -r .name)
           else
-            echo "Arrancando $NAME…"
-            gh api -X POST "$API/user/codespaces/$NAME/start" >/dev/null
+            STATE=$(gh api "$API/user/codespaces/$NAME" --jq .state)
+            echo "Estado inicial de $NAME: $STATE"
+            # Available/Running = ya activo (sin sesión abierta reporta Available)
+            case "$STATE" in
+              Running|Available) : ;;
+              *) gh api -X POST "$API/user/codespaces/$NAME/start" >/dev/null || true ;;
+            esac
           fi
-          # Esperar a running (máx ~5 min)
+          # Esperar a activo (máx ~5 min)
           STATE=""
           for i in $(seq 1 15); do
             sleep 20
             STATE=$(gh api "$API/user/codespaces/$NAME" --jq .state)
             echo "  [$i] $NAME = $STATE"
-            [ "$STATE" = "Running" ] && break
-            [ "$STATE" = "Failed" ] && break
+            case "$STATE" in Running|Available|Failed) break;; esac
           done
-          if [ "$STATE" = "Running" ]; then
-            rpc running started "{\"p_codespace_name\":\"$NAME\"}"
-          else
-            rpc stopped start_failed "{\"p_codespace_name\":\"$NAME\",\"p_final_state\":\"$STATE\"}"
-            exit 1
-          fi
+          case "$STATE" in
+            Running|Available)
+              rpc running started "{\"p_codespace_name\":\"$NAME\"}" ;;
+            *)
+              rpc stopped start_failed "{\"p_codespace_name\":\"$NAME\",\"p_final_state\":\"$STATE\"}"
+              exit 1 ;;
+          esac
 
       - name: Parar workspace
         if: inputs.action == 'stop'
