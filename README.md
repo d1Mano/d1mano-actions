@@ -19,6 +19,8 @@ agente. Los secretos llegan en runtime vía GitHub Secrets / Supabase.
 | Workflow | Fase | Rol |
 |---|---|---|
 | `health.yml` | 2 | Prueba del canal: `workflow_dispatch` → runner → resultado, con medición de tiempos |
+| `manage-workspace.yml` | 3 | Ciclo de vida del Codespace (start/stop/status/list) + estado en Supabase `agent_control` |
+| `agent-runtime.yml` | 5/7 | Control del runtime del agente DENTRO del Codespace (start/stop/status/selftest vía SSH) |
 
 ## Uso rápido
 
