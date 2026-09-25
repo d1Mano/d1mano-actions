@@ -1,0 +1,90 @@
+name: manage-workspace
+
+# Fase 3 — gestión del Codespace del workspace:
+#   localizar / arrancar / parar / estado, vía GitHub REST API.
+# El Codespace se crea sobre WORKSPACE_REPO (donde vive el devcontainer),
+# no sobre este repo orquestador.
+#
+# Requiere secret CODESPACES_TOKEN: PAT de la cuenta colaboradora dueña del
+# Codespace, con scopes `codespace` + `repo` (d1mano-automation es privado).
+# El token NUNCA se commitea; se configura en Settings → Secrets del repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Acción: start | stop | status | list"
+        required: true
+        default: "status"
+        type: string
+      workspace:
+        description: "Nombre del Codespace (opcional; si no, usa el primero del repo)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ secrets.CODESPACES_TOKEN }}
+  API: https://api.github.com
+  WORKSPACE_REPO: d1Mano/d1mano-automation
+
+jobs:
+  workspace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Listar Codespaces del workspace
+        if: inputs.action == 'list'
+        run: |
+          gh api "$API/repos/$WORKSPACE_REPO/codespaces" \
+            --jq '.codespaces[] | {name, state, machine: .machine.display_name, idle_timeout: .idle_timeout_minutes}'
+
+      - name: Estado del workspace
+        if: inputs.action == 'status'
+        run: |
+          if [ -n "${{ inputs.workspace }}" ]; then
+            gh api "$API/user/codespaces/${{ inputs.workspace }}" \
+              --jq '{name, state, machine: .machine.display_name, last_used: .last_used_at}'
+          else
+            gh api "$API/repos/$WORKSPACE_REPO/codespaces" \
+              --jq '.codespaces[] | {name, state, machine: .machine.display_name}'
+          fi
+
+      - name: Arrancar workspace
+        if: inputs.action == 'start'
+        run: |
+          NAME="${{ inputs.workspace }}"
+          if [ -z "$NAME" ]; then
+            NAME=$(gh api "$API/repos/$WORKSPACE_REPO/codespaces" \
+              --jq '.codespaces[0].name // empty')
+          fi
+          if [ -z "$NAME" ]; then
+            echo "No hay Codespace: creando uno sobre $WORKSPACE_REPO…"
+            gh api -X POST "$API/repos/$WORKSPACE_REPO/codespaces" \
+              -f machine=basicLinux32gb \
+              -f branch=main \
+              --jq '{name, state, machine: .machine.display_name}'
+          else
+            echo "Arrancando $NAME…"
+            gh api -X POST "$API/user/codespaces/$NAME/start" \
+              --jq '{name, state}'
+          fi
+
+      - name: Parar workspace
+        if: inputs.action == 'stop'
+        run: |
+          NAME="${{ inputs.workspace }}"
+          if [ -z "$NAME" ]; then
+            NAME=$(gh api "$API/repos/$WORKSPACE_REPO/codespaces" \
+              --jq '.codespaces[0].name // empty')
+          fi
+          if [ -n "$NAME" ]; then
+            echo "Parando $NAME…"
+            gh api -X POST "$API/user/codespaces/$NAME/stop" --jq '{name, state}'
+          else
+            echo "No hay Codespace que parar."
+          fi
