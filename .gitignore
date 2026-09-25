@@ -1,0 +1,19 @@
+# Secretos y entorno local (jamás en el repo público)
+.env
+.env.*
+*.pem
+auth.json
+secrets/
+
+# Ejecución local
+output/
+workspace/
+tmp/
+*.log
+
+# Sistema
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+.venv/

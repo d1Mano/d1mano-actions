@@ -1,0 +1,61 @@
+name: health
+
+# Fase 2 — prueba mínima del canal de orquestación:
+#   d1Mano (edge function) → workflow_dispatch → runner → resultado.
+# No requiere secretos. Mide el coste real del job (temporizador interno).
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: "Carga opcional de prueba (eco en el log)"
+        required: false
+        default: "ping"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Start timer
+        run: |
+          echo "START_EPOCH_MS=$(date +%s%3N)" >> "$GITHUB_ENV"
+          echo "TRACE_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Show payload
+        run: |
+          echo "PAYLOAD=${{ inputs.payload }}"
+          echo "RUN_ID=${{ github.run_id }}"
+          echo "RUNNER_OS=${{ runner.os }}"
+
+      - name: Environment check
+        run: |
+          echo "Node: $(node --version)"
+          echo "Python: $(python3 --version)"
+          echo "Git: $(git --version)"
+          echo "gh: $(gh --version | head -1)"
+
+      - name: End timer
+        run: |
+          END_EPOCH_MS=$(date +%s%3N)
+          DURATION=$((END_EPOCH_MS - START_EPOCH_MS))
+          {
+            echo "RUN_ID=${{ github.run_id }}"
+            echo "TRACE_START=${TRACE_START}"
+            echo "TRACE_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "PHASE_TOTAL_MS=${DURATION}"
+            echo "DURATION_SECONDS=$(python3 -c "print(${DURATION}/1000)")"
+          } | tee timing.txt
+
+      - name: Upload timing
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timing-${{ github.run_id }}
+          path: timing.txt
+          if-no-files-found: warn
