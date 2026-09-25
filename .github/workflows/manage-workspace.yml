@@ -34,9 +34,11 @@ permissions:
   contents: read
 
 env:
-  GH_TOKEN: ${{ secrets.CODESPACES_TOKEN }}
   API: https://api.github.com
   WORKSPACE_REPO: d1Mano/d1mano-automation
+  # token de la cuenta dueña del codespace: A=Lugoci-dev, B=d1Mano
+  GH_TOKEN_A: ${{ secrets.CODESPACES_TOKEN }}
+  GH_TOKEN_B: ${{ secrets.CODESPACES_TOKEN_B }}
   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
   SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
@@ -46,6 +48,14 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Token de la cuenta dueña (A o B)
+        run: |
+          if [ "${{ inputs.workspace_id }}" = "workspace-b" ]; then
+            echo "GH_TOKEN=$GH_TOKEN_B" >> "$GITHUB_ENV"
+          else
+            echo "GH_TOKEN=$GH_TOKEN_A" >> "$GITHUB_ENV"
+          fi
+
       - name: Preparar helper RPC (persiste como archivo entre steps)
         run: |
           cat > rpc.sh <<'EOF'

@@ -22,13 +22,20 @@ on:
         required: false
         default: ""
         type: string
+      workspace_id:
+        description: "Fila en Supabase (workspace-a | workspace-b) — define la cuenta"
+        required: false
+        default: "workspace-a"
+        type: string
 
 permissions:
   contents: read
 
 env:
-  GH_TOKEN: ${{ secrets.CODESPACES_TOKEN }}
   WORKSPACE_REPO: d1Mano/d1mano-automation
+  # token de la cuenta dueña del codespace: A=Lugoci-dev, B=d1Mano
+  GH_TOKEN_A: ${{ secrets.CODESPACES_TOKEN }}
+  GH_TOKEN_B: ${{ secrets.CODESPACES_TOKEN_B }}
 
 jobs:
   runtime:
@@ -36,6 +43,13 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Token de la cuenta dueña (A o B)
+        run: |
+          if [ "${{ inputs.workspace_id }}" = "workspace-b" ]; then
+            echo "GH_TOKEN=$GH_TOKEN_B" >> "$GITHUB_ENV"
+          else
+            echo "GH_TOKEN=$GH_TOKEN_A" >> "$GITHUB_ENV"
+          fi
       - name: Resolver codespace
         id: cs
         run: |
@@ -68,8 +82,9 @@ jobs:
         run: |
           # Los user secrets de Codespaces no llegan al SSH no interactivo:
           # se escriben en .env.runtime (gitignored, 600) que agent_ctl carga.
-          printf 'SUPABASE_URL=%s\nSUPABASE_SERVICE_KEY=%s\n' \
-            "${{ secrets.SUPABASE_URL }}" "${{ secrets.SUPABASE_SERVICE_KEY }}" | \
+          printf 'SUPABASE_URL=%s\nSUPABASE_SERVICE_KEY=%s\nWORKSPACE_ID=%s\n' \
+            "${{ secrets.SUPABASE_URL }}" "${{ secrets.SUPABASE_SERVICE_KEY }}" \
+            "${{ inputs.workspace_id }}" | \
           gh codespace ssh -c "${{ steps.cs.outputs.name }}" -- \
             'cat > /workspaces/d1mano-automation/.env.runtime && \
              chmod 600 /workspaces/d1mano-automation/.env.runtime && echo credenciales inyectadas'
