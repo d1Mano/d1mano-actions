@@ -27,6 +27,11 @@ on:
         required: false
         default: "workspace-a"
         type: string
+      oc_mode:
+        description: "Modo del agente de Telegram: db (solo SQL, sin editar código) | code (por defecto)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -82,9 +87,10 @@ jobs:
         run: |
           # Los user secrets de Codespaces no llegan al SSH no interactivo:
           # se escriben en .env.runtime (gitignored, 600) que agent_ctl carga.
-          printf 'SUPABASE_URL=%s\nSUPABASE_SERVICE_KEY=%s\nWORKSPACE_ID=%s\nGH_BILLING_TOKEN_A=%s\nGH_BILLING_TOKEN_B=%s\n' \
+          printf 'SUPABASE_URL=%s\nSUPABASE_SERVICE_KEY=%s\nWORKSPACE_ID=%s\nGH_BILLING_TOKEN_A=%s\nGH_BILLING_TOKEN_B=%s\nOC_MODE=%s\n' \
             "${{ secrets.SUPABASE_URL }}" "${{ secrets.SUPABASE_SERVICE_KEY }}" \
-            "${{ inputs.workspace_id }}" "${{ secrets.BILLING_TOKEN_A }}" "${{ secrets.BILLING_TOKEN_B }}" | \
+            "${{ inputs.workspace_id }}" "${{ secrets.BILLING_TOKEN_A }}" "${{ secrets.BILLING_TOKEN_B }}" \
+            "${{ inputs.oc_mode }}" | \
           gh codespace ssh -c "${{ steps.cs.outputs.name }}" -- \
             'cat > /workspaces/d1mano-automation/.env.runtime && \
              chmod 600 /workspaces/d1mano-automation/.env.runtime && echo credenciales inyectadas'
