@@ -63,6 +63,23 @@ jobs:
              git reset --hard FETCH_HEAD >/dev/null && \
              echo "repo actualizado: $(git log -1 --format=%h)"'
 
+      - name: Inyectar credenciales runtime (start|selftest)
+        if: inputs.action == 'start' || inputs.action == 'selftest'
+        run: |
+          # Los user secrets de Codespaces no llegan al SSH no interactivo:
+          # se escriben en .env.runtime (gitignored, 600) que agent_ctl carga.
+          printf 'SUPABASE_URL=%s\nSUPABASE_SERVICE_KEY=%s\n' \
+            "${{ secrets.SUPABASE_URL }}" "${{ secrets.SUPABASE_SERVICE_KEY }}" | \
+          gh codespace ssh -c "${{ steps.cs.outputs.name }}" -- \
+            'cat > /workspaces/d1mano-automation/.env.runtime && \
+             chmod 600 /workspaces/d1mano-automation/.env.runtime && echo credenciales inyectadas'
+
+      - name: Limpiar credenciales runtime (stop)
+        if: inputs.action == 'stop'
+        run: |
+          gh codespace ssh -c "${{ steps.cs.outputs.name }}" -- \
+            'rm -f /workspaces/d1mano-automation/.env.runtime && echo credenciales limpiadas' || true
+
       - name: Ejecutar acción sobre el runtime
         run: |
           ACTION="${{ inputs.action }}"
