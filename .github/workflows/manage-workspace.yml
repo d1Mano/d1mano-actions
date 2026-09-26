@@ -114,11 +114,18 @@ jobs:
           for i in $(seq 1 15); do
             sleep 20
             STATE=$(gh api "$API/user/codespaces/$NAME" --jq .state)
-            echo "  [$i] $NAME = $STATE"
-            case "$STATE" in Running|Available|Failed) break;; esac
+            echo "  [$i] $NAME = $STATE"            case "$STATE" in
+              Running|Available|Failed) break;; esac
           done
           case "$STATE" in
             Running|Available)
+              # Idle timeout al máximo (240 min): los procesos en background
+              # del bridge NO cuentan como actividad para GitHub — con el
+              # default de 30 min la VM se dormía a mitad de una conversación
+              # del bot (visto en prod 2026-09-26 03:38). El owner para el
+              # workspace manualmente desde la app cuando termina.
+              gh api -X PATCH "$API/user/codespaces/$NAME" \
+                -f idle_timeout_minutes=240 --jq .idle_timeout_minutes || true
               bash rpc.sh running started "\"p_codespace_name\":\"$NAME\"" ;;
             *)
               bash rpc.sh stopped start_failed "\"p_codespace_name\":\"$NAME\",\"p_final_state\":\"$STATE\""
