@@ -1,0 +1,117 @@
+name: workspace-watchdog
+
+# Guardián de workspaces (dos problemas reales vistos en prod):
+#   1) El codespace se duerme por idle timeout (30 min default; el PATCH
+#      por API está roto para codespaces existentes — GH bug #70543) y el
+#      bot queda MUDO a mitad de una conversación.
+#   2) El bot sin actividad quema cuota toda la noche si nadie lo para.
+#
+# Cada 15 min (job corto, ~10s):
+#   - workspace status=running con last_heartbeat >10 min → REVIVIR:
+#     agent_ctl stop (si la VM está arriba) + manage-workspace start
+#     (repo al día + runtime desplegado). El mensaje caído de Telegram
+#     se procesa al levantar (nota 📥 del bridge).
+#   - workspace running con heartbeat fresco pero SIN session_used hace
+#     >60 min → AUTO-STOP (ahorro de cuota; el owner lo vuelve a prender
+#     desde la app cuando quiera).
+# El dispatch entre workflows usa el PAT (CODESPACES_TOKEN): el
+# GITHUB_TOKEN interno no dispara otros workflows.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+  GH_TOKEN_A: ${{ secrets.CODESPACES_TOKEN }}
+  GH_TOKEN_B: ${{ secrets.CODESPACES_TOKEN_B }}
+  # umbrales en minutos
+  HB_STALE_MIN: 10
+  BOT_IDLE_MIN: 60
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: workspace-watchdog
+      cancel-in-progress: false
+
+    steps:
+      - name: Evaluar workspaces y actuar
+        run: |
+          set -euo pipefail
+          NOW=$(date +%s)
+
+          # ─── SQL parametrizado sin dolores de quoting ───
+          sql() { jq -n --arg q "$1" '{p_query:$q}'; }
+          rpc_sql() {
+            curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/service_execute_sql" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: application/json" -d "$(sql "$1")"
+          }
+
+          for WS in workspace-a workspace-b; do
+            if [ "$WS" = "workspace-b" ]; then
+              export GH_TOKEN="$GH_TOKEN_B"
+            else
+              export GH_TOKEN="$GH_TOKEN_A"
+            fi
+
+            ROW=$(curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/service_get_workspace" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg ws "$WS" '{p_workspace:$ws}')" || echo '{}')
+            STATUS=$(echo "$ROW" | jq -r '.status // "none"')
+            HB=$(echo "$ROW" | jq -r '.last_heartbeat // ""')
+            echo "== $WS: status=$STATUS heartbeat=$HB"
+
+            [ "$STATUS" = "running" ] || { echo "   no está running → nada que hacer"; continue; }
+
+            # heartbeat vacío/ilegible = stale (revive); date falla → 0 → age enorme
+            HB_EPOCH=$(date -d "$HB" +%s 2>/dev/null || echo 0)
+            HB_AGE=$(( (NOW - HB_EPOCH) / 60 ))
+
+            if [ "$HB_AGE" -gt "$HB_STALE_MIN" ]; then
+              # ─── REVIVIR: heartbeat viejo = bridge muerto o VM dormida ───
+              echo "   🔴 heartbeat hace ${HB_AGE} min (> $HB_STALE_MIN) → reviviendo"
+              # si la VM está activa, matar el runtime viejo (pid zombie)
+              CS=$(echo "$ROW" | jq -r '.codespace_name // ""')
+              if [ -n "$CS" ]; then
+                STATE=$(gh api "user/codespaces/$CS" --jq .state 2>/dev/null || echo "?")
+                if [ "$STATE" = "Running" ] || [ "$STATE" = "Available" ]; then
+                  gh workflow run agent-runtime.yml -R d1Mano/d1mano-actions \
+                    -f action=stop -f workspace_id="$WS" || true
+                  sleep 20   # que el stop termine antes del start
+                fi
+              fi
+              gh workflow run manage-workspace.yml -R d1Mano/d1mano-actions \
+                -f action=start -f workspace_id="$WS"
+              echo "   ✅ dispatch de arranque enviado"
+              continue
+            fi
+
+            # ─── AUTO-STOP: bot sin actividad hace > 60 min ───
+            LAST=$( (rpc_sql "select created_at from agent_control.agent_events
+                            where workspace = '$WS' and event = 'session_used'
+                            order by created_at desc limit 1" \
+                     || echo '[]') | jq -r '.[0].created_at // ""' )
+            if [ -z "$LAST" ]; then
+              echo "   sin session_used registrados → no auto-stop (poco historial)"
+              continue
+            fi
+            IDLE=$(( (NOW - $(date -d "$LAST" +%s)) / 60 ))
+            echo "   última actividad del bot: hace ${IDLE} min"
+            if [ "$IDLE" -gt "$BOT_IDLE_MIN" ]; then
+              echo "   💤 sin actividad hace ${IDLE} min (> $BOT_IDLE_MIN) → auto-stop por cuota"
+              gh workflow run manage-workspace.yml -R d1Mano/d1mano-actions \
+                -f action=stop -f workspace_id="$WS"
+              echo "   ✅ dispatch de parada enviado"
+            fi
+          done
+          echo "watchdog OK"
