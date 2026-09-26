@@ -71,10 +71,10 @@ jobs:
             # service_get_workspace NO trae heartbeat/codespace (RPC recortado 0008):
             # heartbeat = último evento 'heartbeat' de agent_events (cada 60s si vivo);
             # codespace_name = tabla workspaces (service_execute_sql lee agent_control).
-            HB=$( (rpc_sql "select coalesce(max(created_at),'') as hb from agent_control.agent_events where workspace = '$WS' and event = 'heartbeat'") \
-                  | jq -r '.[0].hb // ""' )
-            CS=$( (rpc_sql "select codespace_name from agent_control.workspaces where id = '$WS'") \
-                  | jq -r '.[0].codespace_name // ""' )
+            HB=$( { rpc_sql "select coalesce(max(created_at)::text, '') as hb from agent_control.agent_events where workspace = '$WS' and event = 'heartbeat'" \
+                  || echo '[]'; } | jq -r '.[0].hb // ""' )
+            CS=$( { rpc_sql "select codespace_name::text from agent_control.workspaces where id = '$WS'" \
+                  || echo '[]'; } | jq -r '.[0].codespace_name // ""' )
             echo "== $WS: status=$STATUS heartbeat=$HB codespace=$CS"
 
             [ "$STATUS" = "running" ] || { echo "   no está running → nada que hacer"; continue; }
@@ -102,10 +102,10 @@ jobs:
             fi
 
             # ─── AUTO-STOP: bot sin actividad hace > 60 min ───
-            LAST=$( (rpc_sql "select created_at from agent_control.agent_events
+            LAST=$( { rpc_sql "select created_at::text from agent_control.agent_events
                             where workspace = '$WS' and event = 'session_used'
                             order by created_at desc limit 1" \
-                     || echo '[]') | jq -r '.[0].created_at // ""' )
+                     || echo '[]'; } | jq -r '.[0].created_at // ""' )
             if [ -z "$LAST" ]; then
               echo "   sin session_used registrados → no auto-stop (poco historial)"
               continue
