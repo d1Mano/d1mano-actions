@@ -114,7 +114,8 @@ jobs:
           for i in $(seq 1 15); do
             sleep 20
             STATE=$(gh api "$API/user/codespaces/$NAME" --jq .state)
-            echo "  [$i] $NAME = $STATE"            case "$STATE" in
+            echo "  [$i] $NAME = $STATE"
+            case "$STATE" in
               Running|Available|Failed) break;; esac
           done
           case "$STATE" in
