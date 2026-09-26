@@ -68,8 +68,14 @@ jobs:
               -H "Content-Type: application/json" \
               -d "$(jq -n --arg ws "$WS" '{p_workspace:$ws}')" || echo '{}')
             STATUS=$(echo "$ROW" | jq -r '.status // "none"')
-            HB=$(echo "$ROW" | jq -r '.last_heartbeat // ""')
-            echo "== $WS: status=$STATUS heartbeat=$HB"
+            # service_get_workspace NO trae heartbeat/codespace (RPC recortado 0008):
+            # heartbeat = último evento 'heartbeat' de agent_events (cada 60s si vivo);
+            # codespace_name = tabla workspaces (service_execute_sql lee agent_control).
+            HB=$( (rpc_sql "select coalesce(max(created_at),'') as hb from agent_control.agent_events where workspace = '$WS' and event = 'heartbeat'") \
+                  | jq -r '.[0].hb // ""' )
+            CS=$( (rpc_sql "select codespace_name from agent_control.workspaces where id = '$WS'") \
+                  | jq -r '.[0].codespace_name // ""' )
+            echo "== $WS: status=$STATUS heartbeat=$HB codespace=$CS"
 
             [ "$STATUS" = "running" ] || { echo "   no está running → nada que hacer"; continue; }
 
@@ -81,7 +87,6 @@ jobs:
               # ─── REVIVIR: heartbeat viejo = bridge muerto o VM dormida ───
               echo "   🔴 heartbeat hace ${HB_AGE} min (> $HB_STALE_MIN) → reviviendo"
               # si la VM está activa, matar el runtime viejo (pid zombie)
-              CS=$(echo "$ROW" | jq -r '.codespace_name // ""')
               if [ -n "$CS" ]; then
                 STATE=$(gh api "user/codespaces/$CS" --jq .state 2>/dev/null || echo "?")
                 if [ "$STATE" = "Running" ] || [ "$STATE" = "Available" ]; then
