@@ -69,7 +69,7 @@ if [ ! -f "$TEMPLATE_FILE" ]; then
     cp "$(dirname "$0")/generate_post_prompt.md" "$TEMPLATE_FILE"
   elif [ -n "${AUTOMATION_PAT:-}" ]; then
     curl -sS --fail-with-body \
-      -H "Authorization: -Bearer $AUTOMATION_PAT" -H "Accept: application/vnd.github+json" \
+      -H "Authorization: Bearer $AUTOMATION_PAT" -H "Accept: application/vnd.github+json" \
       "https://api.github.com/repos/d1Mano/d1mano-automation/contents/scripts/generate_post_prompt.md?ref=main" \
       | jq -r '.content' | base64 -d > "$TEMPLATE_FILE" \
       || fail "No pude descargar el template del generador"
