@@ -84,11 +84,15 @@ echo "::group::3. OpenCode"
 MODEL="${POST_MODEL:-}"
 if [ -z "$MODEL" ]; then
   # Igual que las tasks: el modelo vive en system_config (service_get_config).
-  MODEL=$(curl -sS -X POST "$API/rpc/service_get_config" "${AUTH[@]}" \
-      -H "Content-Type: application/json" -d '{"p_key":"OC_MODEL_POSTS"}' \
-      | jq -r '. // empty' 2>/dev/null) || MODEL=""
+  # Cadena: OC_MODEL_POSTS → OC_MODEL_TASKS (el free probado) → big-pickle.
+  for K in OC_MODEL_POSTS OC_MODEL_TASKS; do
+    [ -n "$MODEL" ] && break
+    MODEL=$(curl -sS -X POST "$API/rpc/service_get_config" "${AUTH[@]}" \
+        -H "Content-Type: application/json" -d "{\"p_key\":\"$K\"}" \
+        | jq -r '. // empty' 2>/dev/null) || MODEL=""
+  done
 fi
-MODEL="${MODEL:-mimo-v2.6-flash-free}"
+MODEL="${MODEL:-big-pickle}"
 echo "model=inhouse/$MODEL"
 
 SYSTEM=$(cat "$TEMPLATE_FILE")
