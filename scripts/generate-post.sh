@@ -79,48 +79,64 @@ if [ ! -f "$TEMPLATE_FILE" ]; then
   echo "::endgroup::"
 fi
 
-# ── 3. LLM ──
-echo "::group::3. LLM"
-MODEL="${POST_MODEL:-openai/gpt-4o-mini}"
-if [ -n "${OPENROUTER_API_KEY:-}" ]; then
-  LLM_URL="https://openrouter.ai/api/v1/chat/completions"
-  LLM_AUTH=( -H "Authorization: Bearer $OPENROUTER_API_KEY" )
-elif [ -n "${GROQ_API_KEY:-}" ]; then
-  LLM_URL="https://api.groq.com/openai/v1/chat/completions"
-  LLM_AUTH=( -H "Authorization: Bearer $GROQ_API_KEY" )
-  MODEL="${POST_MODEL:-llama-3.3-70b-versatile}"
-else
-  fail "Sin OPENROUTER_API_KEY ni GROQ_API_KEY"
+# ── 3. Generación con OpenCode (modelos free de Zen, sin API keys) ──
+echo "::group::3. OpenCode"
+MODEL="${POST_MODEL:-}"
+if [ -z "$MODEL" ]; then
+  # Igual que las tasks: el modelo vive en system_config (service_get_config).
+  MODEL=$(curl -sS -X POST "$API/rpc/service_get_config" "${AUTH[@]}" \
+      -H "Content-Type: application/json" -d '{"p_key":"OC_MODEL_POSTS"}' \
+      | jq -r '. // empty' 2>/dev/null) || MODEL=""
 fi
-echo "model=$MODEL"
+MODEL="${MODEL:-mimo-v2.6-flash-free}"
+echo "model=inhouse/$MODEL"
 
 SYSTEM=$(cat "$TEMPLATE_FILE")
 USER_MSG=$(printf 'POSTER_TYPE: %s\nDRAFT_ID: %s\nBRIEF_JSON: %s' "$POSTER_TYPE" "$DRAFT_ID" "$BRIEF")
+FULL_PROMPT="${SYSTEM}
 
-REQUEST=$(python3 - "$SYSTEM" "$USER_MSG" "$MODEL" <<'PYEOF'
-import json, sys
-system, user, model = sys.argv[1], sys.argv[2], sys.argv[3]
-print(json.dumps({
-  "model": model,
-  "messages": [
-    {"role": "system", "content": system},
-    {"role": "user", "content": user}
-  ],
-  "temperature": 0.8,
-  "response_format": {"type": "json_object"}
-}))
-PYEOF
-)
+---
 
-RESP=$(curl -sS --fail-with-body "$LLM_URL" "${LLM_AUTH[@]}" \
-  -H "Content-Type: application/json" -d "$REQUEST") \
-  || fail "LLM rechazó la petición"
+${USER_MSG}"
+
+OUT="/tmp/opencode_post_${POST_ID}.log"
+# El exit code del CLI NO es el gate (mismo criterio que las tasks): el JSON
+# de la respuesta es la certificación.
+set +e
+opencode run --pure --model "inhouse/${MODEL}" --auto --title "post-${POST_ID}" "$FULL_PROMPT" 2>&1 | tee "$OUT"
+CODE=$?
+set -e
 echo "::endgroup::"
 
-# ── 4. Parseo del JSON del LLM ──
+# ── 4. Parseo del JSON de la respuesta ──
 echo "::group::4. Parseo y escritura"
-CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
-[ -n "$CONTENT" ] || fail "El LLM devolvió una respuesta vacía"
+CONTENT=$(python3 - "$OUT" <<'PYEOF'
+import json, sys
+text = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+cands = []
+i = 0
+while i < len(text):
+    if text[i] == '{':
+        depth = 0; j = i
+        while j < len(text):
+            if text[j] == '{': depth += 1
+            elif text[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    cands.append(text[i:j+1]); i = j; break
+            j += 1
+    i += 1
+best = None
+for blob in reversed(cands):
+    try: d = json.loads(blob)
+    except Exception: continue
+    if isinstance(d, dict) and all(k in d for k in ('title','body','cta','hashtags')):
+        best = d; break
+if best is None:
+    raise SystemExit('sin JSON title/body/cta/hashtags en la salida de opencode')
+print(json.dumps(best, ensure_ascii=False))
+PYEOF
+) || fail "La salida de opencode no trae el JSON esperado"
 
 echo "$CONTENT" | jq -e '.title and .body and .cta and .hashtags' >/dev/null 2>&1 \
   || fail "El JSON del LLM no trae title/body/cta/hashtags"
@@ -135,7 +151,7 @@ PAYLOAD=$(echo "$CONTENT" | jq -c '{
   ],
   caption: [(.title|tostring), (.body|tostring), (.cta|tostring), (.hashtags|tostring)] | join("\n\n")
 }')
-META=$(echo "$RESP" | jq -c '{model: (.model // null), usage: (.usage // null)}')
+META=$(printf '{"model":"inhouse/%s","usage":null}' "$MODEL")
 
 # caption/blocks al payload; meta con modelo y poster_type.
 FULL=$(echo "$PAYLOAD" | jq -c --argjson meta "$META" --arg pt "$POSTER_TYPE" \

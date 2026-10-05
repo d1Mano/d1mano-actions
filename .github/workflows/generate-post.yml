@@ -9,17 +9,19 @@ name: generate-post
 # Flujo:
 #   1. Lee el brief congelado del post (boceto_posts.brief) + la fila
 #      con service role (Supabase REST, pasa RLS).
-#   2. Llama al LLM (Groq u OpenRouter vía OPENROUTER_API_KEY) con el
-#      template del generador (scripts/generate_post_prompt.md del repo
-#      d1mano-automation) y el brief como contexto.
+#   2. OpenCode CLI con modelos FREE de Zen (inhouse/…) redacta la
+#      publicación en JSON (title/body/cta/hashtags).
 #   3. Escribe caption/blocks/status DIRECTAMENTE en boceto_posts
 #      (service role pasa RLS — mismo patrón que agent_tasks).
 #
 # Secretos requeridos (GitHub Secrets de este repo):
 #   SUPABASE_URL          → project URL (axmbjpfzydlvbabgtmoi)
 #   SUPABASE_SERVICE_ROLE → service role key (NUNCA anon)
-#   OPENROUTER_API_KEY    → key del LLM (o GROQ_API_KEY)
-#   POST_MODEL            → (opcional) modelo, default openai/gpt-4o-mini
+#   POST_MODEL            → (opcional, vars) modelo; default mimo-v2.6-flash-free.
+#
+# Generación: OpenCode CLI con modelos FREE de Zen (inhouse/…) — mismo
+# patrón que process-task.yml, pero en repo público (sin límite mensual
+# del repo privado). Sin APIs de OpenRouter/Groq (flujo legacy).
 # ─────────────────────────────────────────────────────────────
 
 on:
@@ -39,18 +41,21 @@ concurrency:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout orquestador
         uses: actions/checkout@v4
+
+      - name: Instalar OpenCode
+        run: |
+          npm install -g opencode-ai@1.18.32
+          opencode --version
 
       - name: Generar publicación y escribir resultado
         env:
           POST_ID: ${{ inputs.post_id }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           POST_MODEL: ${{ vars.POST_MODEL }}
           # PAT de lectura para bajar el template del generador desde el
           # repo PRIVADO d1mano-automation (scripts/generate_post_prompt.md).
