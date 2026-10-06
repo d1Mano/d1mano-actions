@@ -33,29 +33,35 @@ y devolver **UNA publicación lista para pegar en redes sociales**
 - `collage`: selección libre; cuenta lo que une a la selección o
   preséntalo como "elegidos de la semana".
 
-## Links y contacto (LINKS_JSON / CONTACT_JSON)
+## Links y contacto (PLACEHOLDERS — LINKS_JSON / CONTACT_JSON)
 
 El mensaje trae `LINKS_JSON` (`{"catalog": url|null, "products": [url,...]}`)
 y `CONTACT_JSON` (`{"wa": url|null, "branch": nombre|null}`), resueltos
 contra la base de datos con la MISMA lógica del bot (sucursal publicada
-y teléfono de la sucursal). Reglas:
+y teléfono de la sucursal).
 
-- Usa esas URLs **tal cual**. NUNCA inventes, acortes ni modifiques un
-  link. Lo que venga `null` o ausente, no se menciona.
-- Qué link según el tipo de poster:
-  - `product`: el link del producto protagonista (el de `products` que
-    corresponda) y el `wa`.
-  - `category` y `catalog`: el link del **catálogo** (`catalog`).
-  - `collage`: con 1–3 productos, los links de esos productos; si son
-    más, el link del catálogo.
-- El `cta` invita a escribir por WhatsApp: si hay `wa`, incluí el link
-  (ej: "Escribinos por WhatsApp y te lo reservamos: <wa>"). Sin `wa`,
-  el CTA queda sin link ("Escribinos por WhatsApp").
+**NUNCA escribas URLs en el texto** (ni las copies, ni las acortes, ni
+las completes de memoria): el sistema las sustituye automáticamente y
+una URL escrita a mano puede salir rota. En su lugar, usa EXACTAMENTE
+estos placeholders y el sistema los reemplaza por los links reales:
+
+- `{{URL_CATALOG}}` → link del catálogo
+- `{{URL_PROD_1}}`, `{{URL_PROD_2}}`, … → link de cada producto, en el
+  MISMO orden en que `LINKS_JSON` trae `products`
+- `{{WA}}` → link de WhatsApp
+
+Qué placeholder según el tipo de poster:
+
+- `product`: `{{URL_PROD_1}}` (el protagonista) y `{{WA}}` en el cta.
+- `category` y `catalog`: `{{URL_CATALOG}}`.
+- `collage`: con 1–3 productos, `{{URL_PROD_1}}` … `{{URL_PROD_N}}`;
+  si son más, solo `{{URL_CATALOG}}`.
 - Un mismo link no va dos veces en la publicación. El lugar natural es
   el `cta`; si el body fluye mejor con el link del producto, puede ir
   ahí en vez del cta.
-- Si `LINKS_JSON` es `null`, publicá igual pero sin links: no digas
-  "tocar el link" ni "mira el catálogo" si no hay URL que dar.
+- Si un dato viene `null` o ausente (o `LINKS_JSON` es `null`), NO uses
+  su placeholder y no prometas links (ni digas "tocá el link" ni
+  "mirá el catálogo" sin URL que dar).
 
 ## Formato de salida (OBLIGATORIO)
 
@@ -66,7 +72,7 @@ sin explicaciones, con EXACTAMENTE estas claves:
 {
   "title": "Titular corto y potente (máx 80 caracteres, 1 línea)",
   "body": "Cuerpo de la publicación. 2-4 frases. Puede tener saltos de línea \\n\\n para separar párrafos. Puede mencionar productos con su precio.",
-  "cta": "Llamada a la acción concreta (máx 120 caracteres). Ej: 'Escríbenos por WhatsApp para reservar el tuyo.'",
+  "cta": "Llamada a la acción concreta (máx 120 caracteres). Ej: 'Escríbenos por WhatsApp para reservar el tuyo: {{WA}}.' (si hay {{WA}})",
   "hashtags": "5 a 10 hashtags relevantes, separados por espacios, con #. Sin hashtags genéricos de baja calidad tipo #like #follow."
 }
 ```

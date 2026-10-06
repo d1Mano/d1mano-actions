@@ -244,6 +244,45 @@ echo "::group::4. Parseo y escritura"
 [ -n "$CONTENT" ] \
   || fail "Ningún modelo de la cadena devolvió el JSON esperado (intentos: $ATTEMPTS)"
 
+# Sustitución de placeholders por URLs canónicas: el modelo NUNCA escribe
+# URLs (al copiarlas truca slugs con guiones/acentos y el link queda roto).
+# Escudo final: cualquier URL cruda que no sea exactamente una canónica
+# (p.ej. copiada mal de LINKS_JSON) se elimina del texto.
+CONTENT=$(LINKS="$LINKS" CONTACT="$CONTACT" python3 - "$CONTENT" <<'PYEOF'
+import json, os, re, sys
+d = json.loads(sys.argv[1])
+links = json.loads(os.environ.get('LINKS') or 'null')
+contact = json.loads(os.environ.get('CONTACT') or 'null')
+subs = {}
+if isinstance(links, dict):
+    if links.get('catalog'):
+        subs['{{URL_CATALOG}}'] = links['catalog']
+    for i, u in enumerate(links.get('products') or [], 1):
+        subs['{{URL_PROD_%d}}' % i] = u
+if isinstance(contact, dict) and contact.get('wa'):
+    subs['{{WA}}'] = contact['wa']
+canonical = set(subs.values())
+
+def clean(s):
+    for k, v in subs.items():
+        s = s.replace(k, v)
+    # placeholder sin dato (null/ausente): se elimina con su rastro de puntuación
+    s = re.sub(r'\s*\{\{[A-Z_0-9]+\}\}\s*', ' ', s)
+    s = re.sub(r'[:;,]\s+([.,;])', r'\1', s)
+    def repl(m):
+        u = m.group(0).rstrip('.,;:)')
+        return m.group(0) if u in canonical else ''
+    s = re.sub(r'https?://\S+', repl, s)
+    s = re.sub(r'  +', ' ', s)
+    return s.strip()
+
+for k in ('title', 'body', 'cta', 'hashtags'):
+    d[k] = clean(d[k])
+print(json.dumps(d, ensure_ascii=False))
+PYEOF
+) 2>/dev/null || CONTENT=""
+[ -n "$CONTENT" ] || fail "la sustitución de placeholders corrompió el JSON"
+
 PAYLOAD=$(echo "$CONTENT" | jq -c '{
   title: (.title | tostring),
   blocks: [
