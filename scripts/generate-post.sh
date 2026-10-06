@@ -126,25 +126,27 @@ if [ -z "$MODEL" ]; then
 fi
 MODEL="${MODEL:-big-pickle}"
 
-# Resiliencia: el modelo guardado pudo morir en Zen (promo vencida, etc.).
-# Valido contra el catálogo VIGENTE (TELEGRAM_MODELS, cachea el cron
-# refresh-models) y si no está, caigo al mejor free disponible del catálogo.
+# Cadena de modelos con reintentos: los free de Zen son INTERMITENTES
+# (UnknownError esporádico por request, probado 2026-10-06 — el mismo
+# modelo pasa y falla en minutos). Orden:
+#   1) el modelo elegido (OC_MODEL_POSTS → OC_MODEL_TASKS → big-pickle)
+#   2) todos los free del catálogo VIVO (TELEGRAM_MODELS, cachea el cron)
+#   3) big-pickle como garantía final (dedup)
+CHAIN="$MODEL"
 CAT=$(curl -sS -X POST "$API/rpc/service_get_config" "${AUTH[@]}" \
     -H "Content-Type: application/json" -d '{"p_key":"TELEGRAM_MODELS"}' \
     | jq -r '. // empty' 2>/dev/null) || CAT=""
 if [ -n "$CAT" ]; then
-  IN_CAT=$(echo "$CAT" | jq -r '(if type=="string" then fromjson else . end)
-    | any(.[]; .id == $m)' --arg m "$MODEL" 2>/dev/null) || IN_CAT=""
-  if [ "$IN_CAT" != "true" ]; then
-    ALT=$(echo "$CAT" | jq -r '(if type=="string" then fromjson else . end)
-      | map(select(.id | test("free";"i"))) | .[0].id // empty' 2>/dev/null) || ALT=""
-    if [ -n "$ALT" ]; then
-      echo "::warning::modelo ${MODEL} ya no está en el catálogo de Zen — uso ${ALT}"
-      MODEL="$ALT"
-    fi
-  fi
+  FREES=$(echo "$CAT" | jq -r '(if type=="string" then fromjson else . end)
+    | map(select(.id | test("free";"i"))) | .[].id' 2>/dev/null) || FREES=""
+  for F in $FREES; do
+    echo "$CHAIN" | grep -qx "$F" || CHAIN="$CHAIN
+$F"
+  done
 fi
-echo "model=inhouse/$MODEL"
+echo "$CHAIN" | grep -qx "big-pickle" || CHAIN="$CHAIN
+big-pickle"
+echo "cadena de modelos: $(echo "$CHAIN" | tr '\n' ' ')"
 
 SYSTEM=$(cat "$TEMPLATE_FILE")
 USER_MSG=$(printf 'POSTER_TYPE: %s\nDRAFT_ID: %s\nBRIEF_JSON: %s\nLINKS_JSON: %s\nCONTACT_JSON: %s' "$POSTER_TYPE" "$DRAFT_ID" "$BRIEF" "$LINKS" "$CONTACT")
@@ -156,16 +158,19 @@ ${USER_MSG}"
 
 OUT="/tmp/opencode_post_${POST_ID}.log"
 # El exit code del CLI NO es el gate (mismo criterio que las tasks): el JSON
-# de la respuesta es la certificación.
-set +e
-opencode run --pure --model "inhouse/${MODEL}" --auto --title "post-${POST_ID}" "$FULL_PROMPT" 2>&1 | tee "$OUT"
-CODE=$?
-set -e
-echo "::endgroup::"
-
-# ── 4. Parseo del JSON de la respuesta ──
-echo "::group::4. Parseo y escritura"
-CONTENT=$(python3 - "$OUT" <<'PYEOF'
+# de la respuesta es la certificación. Cada intento tiene timeout propio y
+# la cadena tiene tope de intentos para no agotar el presupuesto del job.
+MAX_ATTEMPTS=6
+CONTENT=""
+ATTEMPTS=0
+for M in $CHAIN; do
+  [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ] && break
+  ATTEMPTS=$((ATTEMPTS + 1))
+  echo "--- intento $ATTEMPTS/$MAX_ATTEMPTS: inhouse/$M ---"
+  set +e
+  timeout 180 opencode run --pure --model "inhouse/$M" --auto --title "post-${POST_ID}" "$FULL_PROMPT" 2>&1 | tee "$OUT"
+  set -e
+  CONTENT=$(python3 - "$OUT" <<'PYEOF'
 import json, sys
 text = open(sys.argv[1], encoding='utf-8', errors='replace').read()
 cands = []
@@ -191,10 +196,20 @@ if best is None:
     raise SystemExit('sin JSON title/body/cta/hashtags en la salida de opencode')
 print(json.dumps(best, ensure_ascii=False))
 PYEOF
-) || fail "La salida de opencode no trae el JSON esperado"
+) 2>/dev/null || CONTENT=""
+  if [ -n "$CONTENT" ] && echo "$CONTENT" | jq -e 'has("title") and has("body") and has("cta") and has("hashtags")' >/dev/null 2>&1; then
+    MODEL="$M"
+    break
+  fi
+  echo "::warning::inhouse/$M no devolvió el JSON esperado — probando el siguiente modelo"
+  CONTENT=""
+done
+echo "::endgroup::"
 
-echo "$CONTENT" | jq -e '.title and .body and .cta and .hashtags' >/dev/null 2>&1 \
-  || fail "El JSON del LLM no trae title/body/cta/hashtags"
+# ── 4. Parseo y escritura ──
+echo "::group::4. Parseo y escritura"
+[ -n "$CONTENT" ] \
+  || fail "Ningún modelo de la cadena devolvió el JSON esperado (intentos: $ATTEMPTS)"
 
 PAYLOAD=$(echo "$CONTENT" | jq -c '{
   title: (.title | tostring),
@@ -206,7 +221,7 @@ PAYLOAD=$(echo "$CONTENT" | jq -c '{
   ],
   caption: [(.title|tostring), (.body|tostring), (.cta|tostring), (.hashtags|tostring)] | join("\n\n")
 }')
-META=$(printf '{"model":"inhouse/%s","usage":null}' "$MODEL")
+META=$(printf '{"model":"inhouse/%s","attempts":%d,"usage":null}' "$MODEL" "$ATTEMPTS")
 
 # caption/blocks al payload; meta con modelo y poster_type.
 FULL=$(echo "$PAYLOAD" | jq -c --argjson meta "$META" --arg pt "$POSTER_TYPE" \
