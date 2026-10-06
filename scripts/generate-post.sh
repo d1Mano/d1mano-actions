@@ -58,7 +58,39 @@ fail() {
   exit 1
 }
 
-# ── 2. Template del generador (repo automation; checkout opcional) ──
+# ── 2b. Links públicos + contacto (RPCs del bot, service role) ──
+# La MISMA lógica canónica del bot de Telegram (migraciones 13/14/16):
+# deep-link por catálogo publicado y contacto por sucursal. El agente
+# recibe las URLs resueltas para tejerlas en la publicación según el
+# tipo de poster; lo que la DB no resuelve, no se menciona.
+BASE_URL="${POST_PUBLIC_BASE:-https://d1mano.github.io/earlyaccess}"
+
+# Solo ids uuid reales: ids de prueba/legacy tumban la RPC con 400.
+UUIDS=$(echo "$BRIEF" | jq -r '[.products[].product.id // empty]
+  | map(select(test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")))
+  | .[0:20] | .[]' 2>/dev/null || true)
+LINKS='null'
+CONTACT='null'
+if [ -n "$UUIDS" ]; then
+  echo "::group::2b. Links públicos y contacto (RPCs del bot)"
+  ID_LIST=$(echo "$UUIDS" | jq -R . | jq -s .)
+  BR=$(curl -sS -X POST "$API/rpc/bot_product_all_branches" "${AUTH[@]}" \
+        -H "Content-Type: application/json" -d "{\"p_product_ids\": $ID_LIST}" || echo '[]')
+  LINKS=$(echo "$BR" | jq -c --arg base "$BASE_URL" '{
+    catalog: ([.[] | {b: .business_slug, br: .branch_slug, c: .catalog_slug}] | .[0] |
+      if . == null then null else "\($base)/catalog/\(.b)/\(.br)/\(.c)" end),
+    products: ([.[] | "\($base)/catalog/\(.business_slug)/\(.branch_slug)/\(.catalog_slug)/product/\(.product_slug)"] | unique)
+  }' 2>/dev/null) || LINKS='null'
+  # Contacto: teléfono de la sucursal canónica (regla migración 16) del
+  # primer producto resuelto. Sin links no hay contacto que buscar.
+  FIRST_UUID=$(echo "$UUIDS" | head -1)
+  CT=$(curl -sS -X POST "$API/rpc/bot_product_contact" "${AUTH[@]}" \
+        -H "Content-Type: application/json" -d "{\"p_product_id\": \"$FIRST_UUID\"}" || echo 'null')
+  CONTACT=$(echo "$CT" | jq -c '{wa: ((.branch.phone // null) | if . == null then null else "https://wa.me/" + (gsub("[^0-9]"; "")) end), branch: (.branch.name // null)}' 2>/dev/null) || CONTACT='null'
+  echo "links: $(echo "$LINKS" | jq -c '.catalog' 2>/dev/null) · wa: $(echo "$CONTACT" | jq -r '.wa // "sin wa"' 2>/dev/null)"
+  echo "::endgroup::"
+fi
+
 TEMPLATE_FILE="${POST_TEMPLATE:-/tmp/generate_post_prompt.md}"
 if [ ! -f "$TEMPLATE_FILE" ]; then
   echo "::group::Descargando template del generador (d1mano-automation, main)"
@@ -93,10 +125,29 @@ if [ -z "$MODEL" ]; then
   done
 fi
 MODEL="${MODEL:-big-pickle}"
+
+# Resiliencia: el modelo guardado pudo morir en Zen (promo vencida, etc.).
+# Valido contra el catálogo VIGENTE (TELEGRAM_MODELS, cachea el cron
+# refresh-models) y si no está, caigo al mejor free disponible del catálogo.
+CAT=$(curl -sS -X POST "$API/rpc/service_get_config" "${AUTH[@]}" \
+    -H "Content-Type: application/json" -d '{"p_key":"TELEGRAM_MODELS"}' \
+    | jq -r '. // empty' 2>/dev/null) || CAT=""
+if [ -n "$CAT" ]; then
+  IN_CAT=$(echo "$CAT" | jq -r '(if type=="string" then fromjson else . end)
+    | any(.[]; .id == $m)' --arg m "$MODEL" 2>/dev/null) || IN_CAT=""
+  if [ "$IN_CAT" != "true" ]; then
+    ALT=$(echo "$CAT" | jq -r '(if type=="string" then fromjson else . end)
+      | map(select(.id | test("free";"i"))) | .[0].id // empty' 2>/dev/null) || ALT=""
+    if [ -n "$ALT" ]; then
+      echo "::warning::modelo ${MODEL} ya no está en el catálogo de Zen — uso ${ALT}"
+      MODEL="$ALT"
+    fi
+  fi
+fi
 echo "model=inhouse/$MODEL"
 
 SYSTEM=$(cat "$TEMPLATE_FILE")
-USER_MSG=$(printf 'POSTER_TYPE: %s\nDRAFT_ID: %s\nBRIEF_JSON: %s' "$POSTER_TYPE" "$DRAFT_ID" "$BRIEF")
+USER_MSG=$(printf 'POSTER_TYPE: %s\nDRAFT_ID: %s\nBRIEF_JSON: %s\nLINKS_JSON: %s\nCONTACT_JSON: %s' "$POSTER_TYPE" "$DRAFT_ID" "$BRIEF" "$LINKS" "$CONTACT")
 FULL_PROMPT="${SYSTEM}
 
 ---
