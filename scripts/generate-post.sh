@@ -126,9 +126,9 @@ if [ -z "$MODEL" ]; then
 fi
 MODEL="${MODEL:-big-pickle}"
 
-# Cadena de modelos con reintentos: los free de Zen son INTERMITENTES
-# (UnknownError esporádico por request, probado 2026-10-06 — el mismo
-# modelo pasa y falla en minutos). Orden:
+# Cadena de modelos con reintentos: los free de Zen fallan por modelos
+# (algunos caen upstream temporalmente, otros no son de texto) — probado
+# 2026-10-06: 8/14 free operativos. Orden:
 #   1) el modelo elegido (OC_MODEL_POSTS → OC_MODEL_TASKS → big-pickle)
 #   2) todos los free del catálogo VIVO (TELEGRAM_MODELS, cachea el cron)
 #   3) big-pickle como garantía final (dedup)
@@ -147,6 +147,17 @@ fi
 echo "$CHAIN" | grep -qx "big-pickle" || CHAIN="$CHAIN
 big-pickle"
 echo "cadena de modelos: $(echo "$CHAIN" | tr '\n' ' ')"
+
+# El CLI solo conoce modelos DECLARADOS en opencode.json (si no: UnknownError
+# engañoso). Inyectamos toda la cadena al config: modelos nuevos del catálogo
+# funcionan sin editar el archivo a mano.
+OC_IDS=$(echo "$CHAIN" | jq -R . | jq -s 'map(select(length>0))')
+if [ -f opencode.json ] && jq -e '.provider.inhouse' opencode.json >/dev/null 2>&1; then
+  jq --argjson ids "$OC_IDS" \
+    '.provider.inhouse.models = ((.provider.inhouse.models // {}) + ($ids | map({(.): {name: .}}) | add // {}))' \
+    opencode.json > /tmp/opencode.gen.json && mv /tmp/opencode.gen.json opencode.json
+  echo "opencode.json: $(jq '.provider.inhouse.models | length' opencode.json) modelos declarados"
+fi
 
 SYSTEM=$(cat "$TEMPLATE_FILE")
 USER_MSG=$(printf 'POSTER_TYPE: %s\nDRAFT_ID: %s\nBRIEF_JSON: %s\nLINKS_JSON: %s\nCONTACT_JSON: %s' "$POSTER_TYPE" "$DRAFT_ID" "$BRIEF" "$LINKS" "$CONTACT")

@@ -9,10 +9,46 @@
       },
       "models": {
         "big-pickle": {
-          "name": "Big Pickle (free)"
+          "name": "big-pickle"
+        },
+        "jev-1.13-free": {
+          "name": "jev-1.13-free"
+        },
+        "deepseek-v4-flash-free": {
+          "name": "deepseek-v4-flash-free"
+        },
+        "muse-spark-1.3-contributor-free": {
+          "name": "muse-spark-1.3-contributor-free"
+        },
+        "muse-spark-1.2-contributor-free": {
+          "name": "muse-spark-1.2-contributor-free"
         },
         "mimo-v2.6-flash-free": {
-          "name": "MiMo V2.6 Flash Free (fallback)"
+          "name": "mimo-v2.6-flash-free"
+        },
+        "space-bunny-free": {
+          "name": "space-bunny-free"
+        },
+        "longcat-2.5-preview-free": {
+          "name": "longcat-2.5-preview-free"
+        },
+        "mimo-v2.5-free": {
+          "name": "mimo-v2.5-free"
+        },
+        "ling-3.0-flash-fin-free": {
+          "name": "ling-3.0-flash-fin-free"
+        },
+        "nemotron-3-ultra-free": {
+          "name": "nemotron-3-ultra-free"
+        },
+        "nemotron-3.5-lightning-free": {
+          "name": "nemotron-3.5-lightning-free"
+        },
+        "fledge-alpha-free": {
+          "name": "fledge-alpha-free"
+        },
+        "ling-3.1-flash-free": {
+          "name": "ling-3.1-flash-free"
         }
       }
     }
