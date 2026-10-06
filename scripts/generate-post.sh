@@ -148,15 +148,35 @@ echo "$CHAIN" | grep -qx "big-pickle" || CHAIN="$CHAIN
 big-pickle"
 echo "cadena de modelos: $(echo "$CHAIN" | tr '\n' ' ')"
 
+# Los free pueden hablar por DOS proveedores:
+#   - opencode/<id> → endpoint oficial zen/v1: protocolo correcto por modelo
+#     (muse, deepseek… NO hablan por el endpoint custom y tiran 'does not
+#     support this protocol'). Se resuelve solo vía models.dev.
+#   - inhouse/<id>  → endpoint custom inference/openai/v1 (big-pickle, mimo…).
 # El CLI solo conoce modelos DECLARADOS en opencode.json (si no: UnknownError
-# engañoso). Inyectamos toda la cadena al config: modelos nuevos del catálogo
-# funcionan sin editar el archivo a mano.
+# engañoso) — al custom los inyectamos; el oficial no necesita declaración.
+OFFICIAL=$(curl -sS --max-time 15 -H "User-Agent: opencode/1.18" -H "Accept: application/json" \
+    https://models.dev/api.json 2>/dev/null | jq -r '.opencode.models | keys[]' 2>/dev/null) || OFFICIAL=""
+
+QCHAIN=""
+while IFS= read -r M; do
+  [ -z "$M" ] && continue
+  if [ -n "$OFFICIAL" ] && echo "$OFFICIAL" | grep -qx "$M"; then
+    QCHAIN="$QCHAIN
+opencode/$M"
+  else
+    QCHAIN="$QCHAIN
+inhouse/$M"
+  fi
+done <<< "$CHAIN"
+echo "cadena calificada: $(echo "$QCHAIN" | tr '\n' ' ')"
+
 OC_IDS=$(echo "$CHAIN" | jq -R . | jq -s 'map(select(length>0))')
 if [ -f opencode.json ] && jq -e '.provider.inhouse' opencode.json >/dev/null 2>&1; then
   jq --argjson ids "$OC_IDS" \
     '.provider.inhouse.models = ((.provider.inhouse.models // {}) + ($ids | map({(.): {name: .}}) | add // {}))' \
     opencode.json > /tmp/opencode.gen.json && mv /tmp/opencode.gen.json opencode.json
-  echo "opencode.json: $(jq '.provider.inhouse.models | length' opencode.json) modelos declarados"
+  echo "opencode.json: $(jq '.provider.inhouse.models | length' opencode.json) modelos declarados (custom)"
 fi
 
 SYSTEM=$(cat "$TEMPLATE_FILE")
@@ -174,12 +194,12 @@ OUT="/tmp/opencode_post_${POST_ID}.log"
 MAX_ATTEMPTS=6
 CONTENT=""
 ATTEMPTS=0
-for M in $CHAIN; do
+for M in $QCHAIN; do
   [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ] && break
   ATTEMPTS=$((ATTEMPTS + 1))
-  echo "--- intento $ATTEMPTS/$MAX_ATTEMPTS: inhouse/$M ---"
+  echo "--- intento $ATTEMPTS/$MAX_ATTEMPTS: $M ---"
   set +e
-  timeout 180 opencode run --pure --model "inhouse/$M" --auto --title "post-${POST_ID}" "$FULL_PROMPT" 2>&1 | tee "$OUT"
+  timeout 180 opencode run --pure --model "$M" --auto --title "post-${POST_ID}" "$FULL_PROMPT" 2>&1 | tee "$OUT"
   set -e
   CONTENT=$(python3 - "$OUT" <<'PYEOF'
 import json, sys
@@ -212,7 +232,7 @@ PYEOF
     MODEL="$M"
     break
   fi
-  echo "::warning::inhouse/$M no devolvió el JSON esperado — probando el siguiente modelo"
+  echo "::warning::$M no devolvió el JSON esperado — probando el siguiente modelo"
   CONTENT=""
 done
 echo "::endgroup::"
@@ -232,7 +252,7 @@ PAYLOAD=$(echo "$CONTENT" | jq -c '{
   ],
   caption: [(.title|tostring), (.body|tostring), (.cta|tostring), (.hashtags|tostring)] | join("\n\n")
 }')
-META=$(printf '{"model":"inhouse/%s","attempts":%d,"usage":null}' "$MODEL" "$ATTEMPTS")
+META=$(printf '{"model":"%s","attempts":%d,"usage":null}' "$MODEL" "$ATTEMPTS")
 
 # caption/blocks al payload; meta con modelo y poster_type.
 FULL=$(echo "$PAYLOAD" | jq -c --argjson meta "$META" --arg pt "$POSTER_TYPE" \
