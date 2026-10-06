@@ -1,0 +1,20 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "inhouse": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenCode Inference Free",
+      "options": {
+        "baseURL": "https://opencode.ai/inference/openai/v1"
+      },
+      "models": {
+        "big-pickle": {
+          "name": "Big Pickle (free)"
+        },
+        "mimo-v2.6-flash-free": {
+          "name": "MiMo V2.6 Flash Free (fallback)"
+        }
+      }
+    }
+  }
+}
