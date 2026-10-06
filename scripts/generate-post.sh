@@ -64,6 +64,8 @@ fail() {
 # recibe las URLs resueltas para tejerlas en la publicación según el
 # tipo de poster; lo que la DB no resuelve, no se menciona.
 BASE_URL="${POST_PUBLIC_BASE:-https://d1mano.github.io/earlyaccess}"
+# La app usa HashRouter: las rutas van tras '#'. Sin el #, el link no resuelve.
+DEEP_BASE="${BASE_URL}/#"
 
 # Solo ids uuid reales: ids de prueba/legacy tumban la RPC con 400.
 UUIDS=$(echo "$BRIEF" | jq -r '[.products[].product.id // empty]
@@ -76,7 +78,7 @@ if [ -n "$UUIDS" ]; then
   ID_LIST=$(echo "$UUIDS" | jq -R . | jq -s .)
   BR=$(curl -sS -X POST "$API/rpc/bot_product_all_branches" "${AUTH[@]}" \
         -H "Content-Type: application/json" -d "{\"p_product_ids\": $ID_LIST}" || echo '[]')
-  LINKS=$(echo "$BR" | jq -c --arg base "$BASE_URL" '{
+  LINKS=$(echo "$BR" | jq -c --arg base "$DEEP_BASE" '{
     catalog: ([.[] | {b: .business_slug, br: .branch_slug, c: .catalog_slug}] | .[0] |
       if . == null then null else "\($base)/catalog/\(.b)/\(.br)/\(.c)" end),
     products: ([.[] | "\($base)/catalog/\(.business_slug)/\(.branch_slug)/\(.catalog_slug)/product/\(.product_slug)"] | unique)
