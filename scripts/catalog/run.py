@@ -156,6 +156,14 @@ class Store:
                 return False
             raise
 
+    def delete(self, bucket: str, paths: Sequence[str]) -> None:
+        if self._root is not None:
+            for path in paths:
+                with contextlib.suppress(FileNotFoundError):
+                    (self._root / bucket / path).unlink()
+            return
+        self._client.storage_delete(bucket, paths)
+
     def put(self, bucket: str, path: str, data: bytes) -> None:
         if self._root is not None:
             target = self._root / bucket / path
@@ -200,6 +208,48 @@ def model_chain(client: Any) -> list[str]:
     return [qualified, *(model for model in fallbacks if model != qualified)]
 
 
+# ────────────────────────────── retention ──────────────────────────────
+
+
+def purge(client: Any, store: Store, limit: int = 20) -> int:
+    """Delete the runs nobody has touched in days, files first and rows after.
+
+    A run is a work record, not business data: what it applied is in the catalog. Kept
+    forever it is one row per product ever read, supplier text included.
+
+    Files go first because the rows are the only place their paths are written down. A
+    cut between the two leaves rows without files, which the next pass finishes; the
+    other order would leave files nobody can name. A run whose files could not be
+    deleted keeps its rows and is tried again next time.
+    """
+    deleted = 0
+    ready: list[str] = []
+    for run in client.expired_runs(limit):
+        run_id = str(run.get("id") or "")
+        paths = [str(path) for path in (run.get("paths") or [])]
+        try:
+            if paths:
+                store.delete(RUNS_BUCKET, paths)
+        except Exception as exc:  # noqa: BLE001 - one stuck run must not keep the rest
+            say(f"::warning::no se pudieron borrar los archivos de una corrida vencida: "
+                f"{type(exc).__name__}")
+            continue
+        ready.append(run_id)
+    if ready:
+        deleted = client.purge_runs(ready)
+    return deleted
+
+
+def purge_quietly(client: Any, store: Store) -> None:
+    """Retention as a side job of a slice: it must never be why a slice fails."""
+    try:
+        gone = purge(client, store)
+        if gone:
+            say(f"retención: {gone} corrida(s) antigua(s) borrada(s)")
+    except Exception as exc:  # noqa: BLE001
+        say(f"::warning::la limpieza de corridas antiguas no pudo correr: {type(exc).__name__}")
+
+
 # ────────────────────────────── prepare ──────────────────────────────
 
 
@@ -225,6 +275,7 @@ def prepare(run_id: str, run_dir: Path) -> int:
 
     run = claim.run or {}
     _logmask.register_all([run.get("business_id"), *(run.get("provider_keys") or [])])
+    purge_quietly(client, Store(client))
     step = int(run.get("current_step") or 1)
     client.run_event(run_id, "SLICE_STARTED", {"slice": claim.slice_count, "step": step})
 
@@ -869,9 +920,9 @@ def write(run_id: str, run_dir: Path, budget: float = WRITE_BUDGET_SECONDS) -> i
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="catalog.run")
-    parser.add_argument("phase", choices=("prepare", "read", "write"))
+    parser.add_argument("phase", choices=("prepare", "read", "write", "purge"))
     parser.add_argument("--run-id", default="")
-    parser.add_argument("--dir", required=True, help="directorio de trabajo de esta porción")
+    parser.add_argument("--dir", default="", help="directorio de trabajo de esta porción")
     parser.add_argument("--cli", default=None,
                         help="(read) comando del modelo; se parte por espacios, sin shell")
     parser.add_argument("--budget", type=float, default=None)
@@ -879,6 +930,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_dir = Path(args.dir)
 
     try:
+        if args.phase == "purge":
+            client = _client()
+            total = 0
+            # A backlog is worked off in a few passes; a pass that deletes nothing ends it.
+            for _ in range(10):
+                gone = purge(client, Store(client))
+                total += gone
+                if gone == 0:
+                    break
+            say(f"retención: {total} corrida(s) borrada(s)")
+            return 0
+        if not args.dir:
+            say("::error::falta --dir")
+            return 2
         if args.phase == "read":
             return read(run_dir, cli=args.cli.split() if args.cli else None,
                         budget=args.budget or READ_BUDGET_SECONDS)

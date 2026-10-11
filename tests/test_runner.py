@@ -71,6 +71,44 @@ class NamesBetweenSuppliers(unittest.TestCase):
         self.assertIsNone(compare.names_contradict("BICICLETA MARCA ONEBOT", "Bicicleta Onebot"))
 
 
+class Retention(unittest.TestCase):
+    class Client:
+        def __init__(self, runs): self.runs, self.purged = runs, []
+        def expired_runs(self, limit=20): return self.runs
+        def purge_runs(self, ids): self.purged = list(ids); return len(ids)
+
+    class Store:
+        def __init__(self, broken=()): self.deleted, self.broken = [], set(broken)
+        def delete(self, bucket, paths):
+            if any(p in self.broken for p in paths): raise OSError("storage down")
+            self.deleted.append((bucket, list(paths)))
+
+    def test_files_go_first_and_only_then_the_rows(self):
+        client = self.Client([{"id": "r1", "paths": ["b/r1/in/00.txt", "b/r1/work/snapshot.json"]},
+                              {"id": "r2", "paths": []}])
+        store = self.Store()
+        self.assertEqual(run.purge(client, store), 2)
+        self.assertEqual(store.deleted, [("catalog-runs", ["b/r1/in/00.txt", "b/r1/work/snapshot.json"])])
+        self.assertEqual(client.purged, ["r1", "r2"])
+
+    def test_a_run_whose_files_could_not_be_deleted_keeps_its_rows(self):
+        client = self.Client([{"id": "r1", "paths": ["b/r1/in/00.txt"]}, {"id": "r2", "paths": ["b/r2/in/00.txt"]}])
+        self.assertEqual(run.purge(client, self.Store(broken={"b/r1/in/00.txt"})), 1)
+        self.assertEqual(client.purged, ["r2"])
+
+    def test_cleanup_never_fails_a_slice(self):
+        class Down:
+            def expired_runs(self, limit=20): raise RuntimeError("down")
+        run.purge_quietly(Down(), self.Store())     # must not raise
+
+    def test_only_the_run_bucket_can_be_deleted_from(self):
+        client = postgrest.Client("https://example.invalid", "k")
+        with self.assertRaises(postgrest.IdentifierRejected):
+            client.storage_delete("agent-private", ["catalog/rules/x.json"])
+        with self.assertRaises(postgrest.IdentifierRejected):
+            client.storage_delete("catalog-runs", ["a/../../b"])
+
+
 class ModelChain(unittest.TestCase):
     class Fake:
         def __init__(self, value): self.value = value

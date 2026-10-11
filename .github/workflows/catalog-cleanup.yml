@@ -1,0 +1,38 @@
+name: catalog-cleanup
+
+# Borra las corridas del agente de catálogo que llevan días sin movimiento,
+# con sus archivos. Cada porción de una corrida ya hace esta limpieza al
+# arrancar; esto es para cuando pasan días sin que nadie corra nada.
+#
+# Sin modelo y sin datos de nadie en el log: sólo imprime cuántas borró.
+
+on:
+  schedule:
+    - cron: "17 7 * * *"   # una vez al día
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: catalog-cleanup
+  cancel-in-progress: false
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Borrar corridas vencidas
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PYTHONPATH: ${{ github.workspace }}/scripts
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m catalog.run purge

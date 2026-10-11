@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TARGETS=(scripts/catalog scripts/catalog-model.sh tests .github/workflows/catalog-agent.yml .github/workflows/catalog-ci.yml)
+TARGETS=(scripts/catalog scripts/catalog-model.sh tests .github/workflows/catalog-agent.yml .github/workflows/catalog-ci.yml .github/workflows/catalog-cleanup.yml)
 fail=0
 
 check() { # nombre, patrón (ERE)

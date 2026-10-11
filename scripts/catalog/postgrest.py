@@ -228,6 +228,8 @@ RPC_FUNCTIONS = frozenset(
         "agent_catalog_run_finish",
         "agent_catalog_auto_approve",
         "agent_catalog_model",
+        "agent_catalog_expired_runs",
+        "agent_catalog_purge_runs",
     }
 )
 
@@ -1248,6 +1250,20 @@ class Client:
             "agent_catalog_auto_approve", "to_apply", "returned_to_client",
         )
 
+    def expired_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Runs past their retention, each with the paths of its own stored files."""
+        rows = self._rpc("agent_catalog_expired_runs", {"p_limit": int(limit)}, attempts=3)
+        return list(rows) if isinstance(rows, list) else []
+
+    def purge_runs(self, run_ids: Sequence[str]) -> int:
+        """Delete expired runs, rows and all. The wrapper re-checks that each one is
+        still expired, so an id sent by mistake deletes nothing."""
+        payload = _require(
+            self._rpc("agent_catalog_purge_runs", {"p_run_ids": list(run_ids)}),
+            "agent_catalog_purge_runs", "deleted",
+        )
+        return _as_int(payload["deleted"], "agent_catalog_purge_runs")
+
     def chosen_model(self) -> str:
         """The model the owner picked for this agent, as a bare identifier.
 
@@ -1305,6 +1321,30 @@ class Client:
     def storage_get(self, bucket: str, path: str) -> bytes:
         """Download one private object. Idempotent, so it retries."""
         return self._storage("GET", bucket, path, STORAGE_READ_BUCKETS)
+
+    def storage_delete(self, bucket: str, paths: Sequence[str]) -> None:
+        """Remove objects from the run bucket. Each path passes the same shape check
+        every other storage call does, and nothing outside the run bucket can be named."""
+        if bucket not in STORAGE_WRITE_BUCKETS:
+            raise IdentifierRejected(f"bucket {bucket!r} is not one this runner may delete from")
+        for path in paths:
+            if ".." in path or not _OBJECT_PATH.match(path):
+                raise IdentifierRejected(f"object path {path!r} is not a path this runner builds")
+        if not paths:
+            return
+        url = f"{self._base}/storage/v1/object/{bucket}"
+        body = json.dumps({"prefixes": list(paths)}).encode("utf-8")
+        headers = {"apikey": self._key, "Authorization": f"Bearer {self._key}",
+                   "Content-Type": "application/json"}
+        request = urllib.request.Request(url, data=body, method="DELETE", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout * 2) as response:
+                response.read()
+        except urllib.error.HTTPError as exc:
+            raise DatabaseRefused(f"DELETE storage {bucket} -> {exc.code}", status=exc.code,
+                                  code="STORAGE_REFUSED") from None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise DatabaseRefused(f"DELETE storage {bucket} did not complete: {exc}") from None
 
     def storage_put(self, bucket: str, path: str, data: bytes,
                     content_type: str = "application/json") -> None:
