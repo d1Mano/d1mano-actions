@@ -55,6 +55,22 @@ class HandedOverArtifacts(unittest.TestCase):
         self.assertEqual(list(kept), ["asked"])
 
 
+class NamesBetweenSuppliers(unittest.TestCase):
+    def pair(self, left, right, price=1000):
+        a = compare.build_view(offer(f"{A}-001", left, price))
+        b = compare.build_view(offer(f"{B}-001", right, price, provider=B))
+        return compare.decide_pair(a, b, 0.9)
+
+    def test_two_models_with_one_spec_sheet_are_separated_without_asking(self):
+        decision = self.pair("MOTO ELÉCTRICA TOPMAQ TANK", "MOTO ELÉCTRICA TOPMAQ F3")
+        self.assertEqual((decision.verdict, decision.rule), (compare.DIFFERENT, compare.RULE_NAME))
+
+    def test_a_name_that_only_says_more_is_not_a_contradiction(self):
+        decision = self.pair("TRICICLO STAR 2026", "TRICICLO ELÉCTRICO STAR 2026")
+        self.assertNotEqual(decision.rule, compare.RULE_NAME)
+        self.assertIsNone(compare.names_contradict("BICICLETA MARCA ONEBOT", "Bicicleta Onebot"))
+
+
 class Commission(unittest.TestCase):
     def test_free_beats_a_value_beats_undeclared(self):
         score = compare.commission_score

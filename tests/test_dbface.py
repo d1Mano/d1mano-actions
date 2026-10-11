@@ -71,6 +71,8 @@ class NameIdentity(unittest.TestCase):
         self.assertTrue(self.same("MOTO DE GASOLINA KATZU SNAPDRAGON", "Moto de Gasolina Katsu Snapdragon"))
         self.assertTrue(self.same("TRICICLO TRACKTION", "Triciclo Traktion 2026"))
         self.assertFalse(self.same("Cuatriciclo eléctrico Bryderk", "Triciclo Eléctrico Bryderk"))
+        self.assertFalse(self.same("BICIMOTICO ELÉCTRICA JMD", "Bicimoto Eléctrica JMD"))
+        self.assertTrue(self.same("MOTICO PRONTEZZA", "Motico Protenzza"))
 
     def test_a_short_name_inside_a_long_one_is_not_enough(self):
         self.assertFalse(self.same(
@@ -99,6 +101,11 @@ class SameSupplier(unittest.TestCase):
         v = run([offer(f"{A}-001", "Moto Halcon Nova", 1200)],
                 [product(uid(1), "Moto Halcon Nova", 1000)])[f"{A}-001"]
         self.assertEqual((v.action, v.reason, v.provider_changes), ("update", "provider_repriced", False))
+
+    def test_supplier_moving_its_own_price_a_lot_waits_for_the_owner(self):
+        v = run([offer(f"{A}-001", "Moto Halcon Nova", 700)],
+                [product(uid(1), "Moto Halcon Nova", 1000)])[f"{A}-001"]
+        self.assertEqual((v.action, v.needs_review), ("update", True))
 
     def test_absurd_price_move_is_not_applied(self):
         v = run([offer(f"{A}-001", "Moto Halcon Nova", 14)],

@@ -499,82 +499,19 @@ def identity_clash(view: ProductView, entry: CatalogEntry) -> str | None:
 # * And the names must share at least one word that is not generic to the whole
 #   catalog. "Moto Eléctrica" alone identifies nothing.
 
-#: Words that decorate a name without saying which product it is.
-NAME_NOISE = frozenset({
-    "marca", "nuevo", "nueva", "nuevos", "nuevas", "original", "originales", "0km",
-    "km", "caja", "oferta", "disponible", "modelo", "tipo",
-})
+NAME_NOISE = _compare.NAME_NOISE
+identity_words = _compare.identity_words
+_pair_words = _compare.pair_words
+
 
 #: A word is generic when at least this share of all names in play uses it. Derived
 #: from the names themselves at run time, so no category or brand list lives here.
 GENERIC_SHARE = 0.05
 
-#: Two spelled-out words are one word misspelt when they are within this many single
-#: letter edits: one for a short word ("katzu"/"katsu"), two for a long one
-#: ("prontezza"/"protenzza"). Counted in edits rather than as a similarity ratio because
-#: a ratio calls "cuatriciclo" and "triciclo" the same word. Words carrying a digit are
-#: model numbers and must match exactly: "a12" is not "a9".
-FUZZY_MIN_LENGTH = 5
-FUZZY_LONG_LENGTH = 8
-
 #: Below this share of words in common, a name that merely *contains* a shorter one is
 #: not the same product: "Batería Must" is inside the name of an inverter that ships
 #: with a Must battery.
 IDENTITY_FLOOR = 0.5
-
-
-def identity_words(name: str) -> tuple[str, ...]:
-    """The words of a name that take part in identity, sorted."""
-    return tuple(sorted({token for token in _compare.name_tokens(name)
-                         if token not in NAME_NOISE}))
-
-
-def _edits(left: str, right: str, limit: int) -> int:
-    """Levenshtein distance, abandoned once it is certain to exceed ``limit``."""
-    if abs(len(left) - len(right)) > limit:
-        return limit + 1
-    previous = list(range(len(right) + 1))
-    for i, a in enumerate(left, start=1):
-        current = [i]
-        for j, b in enumerate(right, start=1):
-            current.append(min(previous[j] + 1, current[j - 1] + 1,
-                               previous[j - 1] + (a != b)))
-        if min(current) > limit:
-            return limit + 1
-        previous = current
-    return previous[-1]
-
-
-def _same_word(left: str, right: str) -> bool:
-    if left == right:
-        return True
-    if any(ch.isdigit() for ch in left + right):
-        return False
-    shorter = min(len(left), len(right))
-    if shorter < FUZZY_MIN_LENGTH:
-        return False
-    limit = 2 if shorter >= FUZZY_LONG_LENGTH else 1
-    return _edits(left, right, limit) <= limit
-
-
-def _pair_words(left: Sequence[str], right: Sequence[str]
-                ) -> tuple[list[tuple[str, str]], list[str], list[str]]:
-    """Pair up the words two names share; return the pairs and each side's leftovers."""
-    remaining = list(right)
-    shared: list[tuple[str, str]] = []
-    only_left: list[str] = []
-    for word in left:
-        if word in remaining:
-            remaining.remove(word)
-            shared.append((word, word))
-            continue
-        match = next((other for other in remaining if _same_word(word, other)), None)
-        if match is None:
-            only_left.append(word)
-        else:
-            remaining.remove(match)
-            shared.append((word, match))
-    return shared, only_left, remaining
 
 
 def generic_words(names: Sequence[Sequence[str]]) -> frozenset[str]:
@@ -768,11 +705,18 @@ def decide(view: ProductView, entry: CatalogEntry, score: float, now: float | No
                         "parece un error de lectura, no se aplica"),
                 **base,
             )
+        # A supplier moving its own price is news, and is applied. A supplier moving it
+        # by a quarter or more is rare enough that it is far more often two different
+        # products under one name; that one waits for the owner.
+        own_gap = _relative_gap(view.price, entry.price)
+        own_doubt = own_gap is not None and own_gap >= _compare.PRICE_TIEBREAK_REL
         return Verdict(
             disposition=CONFLICTO, reason=REASON_REPRICED, action=ACTION_UPDATE,
-            winner="incoming",
+            winner="incoming", needs_review=own_doubt,
             detail=(f"el mismo proveedor cambió su oferta: "
-                    f"{_money(entry.price)} → {_money(view.price)}"),
+                    f"{_money(entry.price)} → {_money(view.price)}"
+                    + (f" · la diferencia es del {own_gap:.0%}: confirma que es el mismo "
+                       "producto" if own_doubt else "")),
             **base,
         )
 

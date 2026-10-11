@@ -131,6 +131,7 @@ TRIAGE = "TRIAGE"
 # which is the only thing that makes "conservative default" auditable rather than a
 # slogan.
 RULE_ADDON = "ADDON_ASYMMETRY"
+RULE_NAME = "NAME_CONTRADICTION"
 RULE_CATEGORICAL = "CATEGORICAL_CONTRADICTION"
 RULE_NUMERIC = "NUMERIC_SPEC_DIFFERENCE"
 RULE_UNIT = "UNIT_UNRESOLVED"
@@ -251,6 +252,102 @@ def name_tokens(text: str) -> tuple[str, ...]:
 def ratio(left: str, right: str) -> float:
     """Character-level similarity. Deterministic for identical inputs, unlike a hash."""
     return SequenceMatcher(None, left, right).ratio()
+
+
+# ───────────────────────── the words of a name ─────────────────────────
+#
+# Names are compared as sets of words, by the rule R-024 states for properties: an
+# omission is not a difference, a contradiction is. "Kvitova" and "Kvitova Premium" may
+# be one product; "Tank" and "F3" are two, however identical their specification sheets.
+
+#: Words that decorate a name without saying which product it is.
+NAME_NOISE = frozenset({
+    "marca", "nuevo", "nueva", "nuevos", "nuevas", "original", "originales", "0km",
+    "km", "caja", "oferta", "disponible", "modelo", "tipo",
+})
+
+#: A word is generic when at least this share of all names in play uses it. Derived
+#: from the names themselves at run time, so no category or brand list lives here.
+GENERIC_SHARE = 0.05
+
+#: Two spelled-out words are one word misspelt when they are within a single letter edit
+#: ("katzu"/"katsu"), or two for long words of equal length ("prontezza"/"protenzza"). Counted in edits rather than as a similarity ratio because
+#: a ratio calls "cuatriciclo" and "triciclo" the same word. Words carrying a digit are
+#: model numbers and must match exactly: "a12" is not "a9".
+FUZZY_MIN_LENGTH = 5
+FUZZY_LONG_LENGTH = 8
+
+def identity_words(name: str) -> tuple[str, ...]:
+    """The words of a name that take part in identity, sorted."""
+    return tuple(sorted({token for token in name_tokens(name)
+                         if token not in NAME_NOISE}))
+
+
+def _edits(left: str, right: str, limit: int) -> int:
+    """Levenshtein distance, abandoned once it is certain to exceed ``limit``."""
+    if abs(len(left) - len(right)) > limit:
+        return limit + 1
+    previous = list(range(len(right) + 1))
+    for i, a in enumerate(left, start=1):
+        current = [i]
+        for j, b in enumerate(right, start=1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1,
+                               previous[j - 1] + (a != b)))
+        if min(current) > limit:
+            return limit + 1
+        previous = current
+    return previous[-1]
+
+
+def same_word(left: str, right: str) -> bool:
+    """Is one of these the other, misspelt?"""
+    if left == right:
+        return True
+    if any(ch.isdigit() for ch in left + right):
+        return False
+    shorter = min(len(left), len(right))
+    if shorter < FUZZY_MIN_LENGTH:
+        return False
+    # Two edits only between long words of the same length -- letters swapped or
+    # mistyped, as in "prontezza"/"protenzza". A length difference of two is a different
+    # word: "bicimotico" is not "bicimoto", it is a smaller vehicle.
+    limit = 2 if shorter >= FUZZY_LONG_LENGTH and len(left) == len(right) else 1
+    return _edits(left, right, limit) <= limit
+
+
+def pair_words(left: Sequence[str], right: Sequence[str]
+                ) -> tuple[list[tuple[str, str]], list[str], list[str]]:
+    """Pair up the words two names share; return the pairs and each side's leftovers."""
+    remaining = list(right)
+    shared: list[tuple[str, str]] = []
+    only_left: list[str] = []
+    for word in left:
+        if word in remaining:
+            remaining.remove(word)
+            shared.append((word, word))
+            continue
+        match = next((other for other in remaining if same_word(word, other)), None)
+        if match is None:
+            only_left.append(word)
+        else:
+            remaining.remove(match)
+            shared.append((word, match))
+    return shared, only_left, remaining
+
+
+def names_contradict(left: str, right: str) -> str | None:
+    """Each name says something the other does not: the words, or ``None``.
+
+    This is the one judgement about a name that code is entitled to make on its own. Two
+    offers whose names each carry a word the other lacks are two products -- a model
+    called Tank and a model called F3 share a motor, a battery and a price band, and are
+    still not the same motorcycle. Asked about such a pair, a model looks at the matching
+    specifications and merges them.
+    """
+    shared, only_left, only_right = pair_words(identity_words(left), identity_words(right))
+    if only_left and only_right:
+        return f"{' '.join(only_left)} / {' '.join(only_right)}"
+    return None
 
 
 # ────────────────────── commercial terms and add-ons ──────────────────────
@@ -1154,6 +1251,16 @@ def decide_pair(left: ProductView, right: ProductView, score: float) -> PairDeci
         return PairDecision(identifier, left.item_key, right.item_key, score, DIFFERENT,
                             RULE_ADDON, gap, (asymmetry,))
 
+    contradiction = names_contradict(left.name, right.name)
+    if contradiction is not None:
+        # Decided here and never asked. A model shown two different models with the same
+        # specification sheet answers "same product", and it did, on real data.
+        return PairDecision(identifier, left.item_key, right.item_key, score, DIFFERENT,
+                            RULE_NAME, gap,
+                            (Difference("name", "name", left.name, right.name,
+                                        f"each name says something the other does not: "
+                                        f"{contradiction}"),))
+
     differences = compare_axes(left, right)
     if any(difference.kind == "categorical" for difference in differences):
         return PairDecision(identifier, left.item_key, right.item_key, score, DIFFERENT,
@@ -1665,7 +1772,8 @@ def reconcile(funnel: dict, dispositions: dict[str, dict],
         )
 
     pairs = funnel["pairs"]
-    partition = (funnel["pairs_different_addon"] + funnel["pairs_different_categorical"]
+    partition = (funnel["pairs_different_addon"] + funnel["pairs_different_name"]
+                 + funnel["pairs_different_categorical"]
                  + funnel["pairs_different_no_price"] + funnel["pairs_triage"]
                  + funnel["pairs_same_deterministic"])
     if pairs != partition:
@@ -1778,6 +1886,7 @@ def run(items: list[dict], triage_verdicts: dict[str, dict] | None = None,
         "cross_provider_pairs_scored": scored,
         "pairs": len(pairs),
         "pairs_different_addon": by_rule.get(RULE_ADDON, 0),
+        "pairs_different_name": by_rule.get(RULE_NAME, 0),
         "pairs_different_categorical": by_rule.get(RULE_CATEGORICAL, 0),
         "pairs_different_no_price": by_rule.get(RULE_NO_PRICE, 0),
         "pairs_triage": sum(1 for decision in decisions if decision.verdict == TRIAGE),
@@ -1822,6 +1931,8 @@ def _describe(funnel: dict) -> None:
     print(f"\ncross-provider pairs ≥ floor  {funnel['pairs']:>5d}")
     print(f"  → different · add-on        {funnel['pairs_different_addon']:>5d}"
           f"   ({RULE_ADDON})")
+    print(f"  → different · name          {funnel['pairs_different_name']:>5d}"
+          f"   ({RULE_NAME})")
     print(f"  → different · categorical   {funnel['pairs_different_categorical']:>5d}"
           f"   ({RULE_CATEGORICAL})")
     print(f"  → different · no price      {funnel['pairs_different_no_price']:>5d}"
