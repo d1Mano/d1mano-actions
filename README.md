@@ -39,9 +39,16 @@ el prompt y los datos llegan en tiempo de ejecución desde almacenamiento privad
 y nada de eso vive en este repositorio.
 
 ```bash
-python3 -m unittest discover -s tests   # 77 pruebas, datos sintéticos
+python3 -m unittest discover -s tests   # datos sintéticos, sin secretos
 bash scripts/check-leak.sh              # falla si se cuela un identificador real
 ```
 
 Secretos que usa `catalog-agent.yml`: `SUPABASE_URL` y `SUPABASE_SERVICE_KEY`, sólo
-en los pasos sin modelo. Variable opcional `CATALOG_MODELS` (lista separada por comas).
+en los pasos sin modelo. Variable opcional `CATALOG_MODELS` (lista separada por comas,
+con el proveedor `opencode/`).
+
+Sonda del modelo, sin tocar ninguna corrida:
+
+```bash
+gh workflow run catalog-agent.yml -f run_id=00000000-0000-4000-8000-000000000000 -f probe=true
+```
