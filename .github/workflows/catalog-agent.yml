@@ -74,7 +74,10 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          CATALOG_MODELS: ${{ vars.CATALOG_MODELS || 'inhouse/big-pickle,inhouse/mimo-v2.6-flash-free,inhouse/deepseek-v4-flash-free' }}
+          # Cadena de modelos: cada lote prueba el siguiente si el anterior no responde.
+          # Van por el proveedor `opencode/` (el endpoint oficial); por `inhouse/` el
+          # servicio gratuito rechaza la llamada.
+          CATALOG_MODELS: ${{ vars.CATALOG_MODELS || 'opencode/mimo-v2.6-flash-free,opencode/big-pickle,opencode/deepseek-v4-flash-free' }}
         run: |
           install -d -m 755 "$RUN_DIR"
           python3 -m catalog.run prepare --run-id "$RUN_ID" --dir "$RUN_DIR"
