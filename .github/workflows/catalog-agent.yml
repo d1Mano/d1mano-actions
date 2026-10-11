@@ -28,6 +28,11 @@ on:
         description: "Corrida (uuid)"
         required: true
         type: string
+      probe:
+        description: "Sólo sondear el modelo (no toca ninguna corrida)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -71,6 +76,7 @@ jobs:
       # ── prepare · con llave, sin modelo ─────────────────────────────────────
       - name: Reclamar la porción y preparar las fuentes
         id: prepare
+        if: ${{ !inputs.probe }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -84,7 +90,7 @@ jobs:
 
       # ── read · con modelo, sin llave ────────────────────────────────────────
       - name: Preparar el modelo aislado
-        if: steps.prepare.outputs.need_read == 'true'
+        if: ${{ inputs.probe || steps.prepare.outputs.need_read == 'true' }}
         run: |
           sudo npm install -g --silent "opencode-ai@${OPENCODE_VERSION}"
           sudo useradd --create-home --shell /usr/sbin/nologin catalog-model
@@ -107,6 +113,32 @@ jobs:
           if sudo -n -u catalog-model sudo -n true 2>/dev/null; then
             echo "::error::el usuario del modelo tiene sudo"; exit 1
           fi
+
+      # Sonda: una pregunta fija a cada modelo de la cadena, por el mismo camino aislado
+      # que usa una corrida. Sin base de datos y sin datos de nadie. Sirve para saber si
+      # el servicio de modelos responde antes de culpar a la corrida.
+      - name: Sondear el modelo
+        if: ${{ inputs.probe }}
+        env:
+          CATALOG_MODELS: ${{ vars.CATALOG_MODELS || 'opencode/mimo-v2.6-flash-free,opencode/big-pickle,opencode/deepseek-v4-flash-free' }}
+        run: |
+          install -d -m 755 "$RUN_DIR/probe"
+          echo '{"probe": true}' > "$RUN_DIR/probe/data.json"
+          ok=0
+          for model in $(printf '%s' "$CATALOG_MODELS" | tr ',' ' '); do
+            for how in aislado directo; do
+              out="$RUN_DIR/probe/out.txt"
+              if [ "$how" = aislado ]; then
+                timeout 120 sh scripts/catalog-model.sh --model "$model" 'Reply with exactly the word READY and nothing else.' -f "$RUN_DIR/probe/data.json" > "$out" 2>&1 && code=0 || code=$?
+              else
+                (cd "$RUN_DIR/probe" && cp "$GITHUB_WORKSPACE/opencode.json" . && timeout 120 opencode run --pure --model "$model" 'Reply with exactly the word READY and nothing else.' -f data.json) > "$out" 2>&1 && code=0 || code=$?
+              fi
+              last=$(sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$out" | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-140)
+              echo "$model · $how · exit $code · $last"
+              if [ "$how" = aislado ] && grep -q READY "$out"; then ok=1; fi
+            done
+          done
+          [ "$ok" = 1 ] || { echo "::error::ningún modelo de la cadena respondió por el camino aislado"; exit 1; }
 
       - name: Leer los chats y consultar al modelo
         if: steps.prepare.outputs.need_read == 'true'
