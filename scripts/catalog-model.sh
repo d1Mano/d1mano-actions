@@ -6,6 +6,11 @@
 # escribir en el código ni en el directorio de la corrida, y no puede elevarse.
 # Los argumentos pasan tal cual, sin shell de por medio que los reinterprete.
 set -eu
+# Varias consultas corren a la vez. Cada una guarda el estado del CLI en su propio
+# directorio para que no se pisen; la configuración (~/.config) es común y de sólo lectura.
+slot=$(printf '%s' "${CATALOG_MODEL_SLOT:-0}" | tr -cd '0-9')
 exec sudo -n -u catalog-model -H \
   env -i HOME=/home/catalog-model PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
+  XDG_DATA_HOME="/home/catalog-model/.state-${slot:-0}" \
+  XDG_CACHE_HOME="/home/catalog-model/.cache-${slot:-0}" \
   sh -c 'cd "$HOME" && if [ "${1-}" = "--version" ]; then exec opencode --version; fi; exec opencode run --pure "$@"' sh "$@"

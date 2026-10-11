@@ -45,7 +45,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -277,8 +279,8 @@ def validate(document: dict | None, batch: list[dict],
     """The gate. Returns the accepted verdicts, or raises with the reason.
 
     Five things are checked, and each of them exists because a plausible model gets it
-    wrong: the object has a ``verdicts`` array; every pair in the batch appears exactly
-    once; no pair outside the batch appears at all; every verdict is in the closed
+    wrong: the object has a ``verdicts`` array; no pair appears twice; no pair outside
+    the batch appears at all; every verdict is in the closed
     vocabulary with the three required keys and nothing more; and no verdict grants a
     merge to a pair the comparator already refused.
 
@@ -317,9 +319,12 @@ def validate(document: dict | None, batch: list[dict],
             return None, f"pair {pair}: evidence is empty"
         seen[pair] = entry
 
-    missing = sorted(expected - set(seen))
-    if missing:
-        return None, f"{len(missing)} pair(s) left unanswered, first {missing[0]}"
+    if not seen:
+        return None, "the answer holds no verdict"
+    # A model that answers seven of eight has answered seven. The eighth stays
+    # unresolved and is asked again; throwing the seven away would only make the next
+    # call longer. What is *not* tolerated is above: a pair nobody asked about, a pair
+    # answered twice, a verdict outside the vocabulary.
 
     refused: list[str] = []
     for pair in sorted(seen):
@@ -340,6 +345,11 @@ def validate(document: dict | None, batch: list[dict],
 #: under two minutes, and one that is not hangs until it is killed.
 CALL_TIMEOUT_SECONDS = 150
 
+#: How many batches are asked at once. The model service answers a batch in one to two
+#: minutes whatever else is going on, so asking three at a time triples what a slice
+#: gets through. Each worker keeps its own CLI state (see the wrapper script).
+PARALLEL_CALLS = 3
+
 #: How many passes over the queue one slice makes. Each pass asks every unanswered batch
 #: once and moves on, so one batch the model cannot digest never starves the ones behind
 #: it; the next pass comes back to it with the next model of the chain.
@@ -349,7 +359,7 @@ DEFAULT_CLI = ("opencode", "run", "--pure")
 
 
 def invoke(argv: list[str], prompt: str, evidence: Path, transcript: Path,
-           timeout: float = CALL_TIMEOUT_SECONDS) -> tuple[int, float]:
+           timeout: float = CALL_TIMEOUT_SECONDS, slot: int = 0) -> tuple[int, float]:
     """Run the CLI once: prompt as one argument, evidence attached, transcript to a file.
 
     ``shell=False`` with an argv list, so nothing in the prompt can become a command. The
@@ -367,6 +377,9 @@ def invoke(argv: list[str], prompt: str, evidence: Path, transcript: Path,
             completed = subprocess.run(
                 command, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
                 shell=False, check=False, timeout=timeout,
+                # Not a secret and not data: which of the parallel workers this is, so
+                # the wrapper can give each one its own state directory.
+                env={**os.environ, "CATALOG_MODEL_SLOT": str(slot)},
             )
             code = completed.returncode
         except subprocess.TimeoutExpired:
@@ -381,7 +394,7 @@ def run(consolidation: dict, prompt: Path, work_dir: Path, out_path: Path,
         size: int = TRIAGE_BATCH, cli: list[str] | None = None,
         models: list[str] | None = None, resume: bool = False,
         deadline: float | None = None,
-        clock=time.monotonic) -> TriageResult:
+        clock=time.monotonic, parallel: int = PARALLEL_CALLS) -> TriageResult:
     """Triage every queued pair, one batch at a time, checkpointing as it goes.
 
     ``models`` is a chain. The queue is walked in passes: each pass asks every unanswered
@@ -429,81 +442,99 @@ def run(consolidation: dict, prompt: Path, work_dir: Path, out_path: Path,
     base_argv = list(cli or DEFAULT_CLI)
     chain = [m for m in (models or []) if m] or [""]
 
-    batches = build_batches(queue, size)
+    # Batches are cut from the pairs still unanswered, in the queue's own order, so a
+    # pair that was answered -- in an earlier slice or as part of a partial answer -- is
+    # never sent again.
+    pending = [entry for entry in queue if entry["pair_id"] not in answered]
+    batches = build_batches(pending, size)
     reports: dict[int, BatchReport] = {}
     for index, batch in enumerate(batches):
-        pair_ids = [entry["pair_id"] for entry in batch]
-        done = all(pair in answered for pair in pair_ids)
-        reports[index] = BatchReport(index=index, pair_ids=pair_ids,
-                                     status="skipped" if done else "deferred")
+        reports[index] = BatchReport(index=index, status="deferred",
+                                     pair_ids=[entry["pair_id"] for entry in batch])
         result.batches.append(reports[index])
 
-    out_of_time = False
-    for attempt in range(MAX_PASSES):
-        waiting = [index for index in sorted(reports)
-                   if reports[index].status in ("deferred", "rejected")]
-        if not waiting or out_of_time:
-            break
-        model = chain[attempt % len(chain)]
-        for index in waiting:
-            if deadline is not None and clock() >= deadline:
-                out_of_time = True
-                break
-            batch = batches[index]
-            report = reports[index]
-            evidence_path = work_dir / f"batch-{index:04d}.json"
-            evidence_path.write_text(
-                json.dumps({"batch": index, "pairs": batch}, ensure_ascii=False,
-                           indent=1, sort_keys=True),
-                encoding="utf-8",
-            )
-            # The evidence goes in the message itself as well as in the attachment. A
-            # model handed only a file sometimes decides it has to open it, and it has
-            # no tool to open anything with. Compact JSON keeps a batch far below the
-            # size one argument may have.
-            inline = json.dumps({"pairs": batch}, ensure_ascii=False, sort_keys=True,
-                                separators=(",", ":"))
-            prompt_text = prose + CONTRACT.format(evidence_name=evidence_path.name,
-                                                  evidence=inline)
-            argv = [*base_argv, "--model", model] if model else list(base_argv)
-            transcript = work_dir / f"batch-{index:04d}-try{attempt}.out"
-            remaining = None if deadline is None else max(5.0, deadline - clock())
-            limit = CALL_TIMEOUT_SECONDS if remaining is None else min(
-                CALL_TIMEOUT_SECONDS, remaining + 30)
-            report.cli_exit, report.cli_seconds = invoke(
-                argv, prompt_text, evidence_path, transcript, timeout=limit)
+    lock = threading.Lock()
+
+    def ask(index: int, attempt: int, model: str, slot: int) -> None:
+        report = reports[index]
+        batch = [entry for entry in batches[index] if entry["pair_id"] not in answered]
+        if not batch:
+            report.status = "accepted"
+            return
+        evidence_path = work_dir / f"batch-{index:04d}-try{attempt}.json"
+        evidence_path.write_text(
+            json.dumps({"batch": index, "pairs": batch}, ensure_ascii=False,
+                       indent=1, sort_keys=True),
+            encoding="utf-8",
+        )
+        # The evidence goes in the message itself as well as in the attachment. A model
+        # handed only a file sometimes decides it has to open it, and it has no tool to
+        # open anything with. Compact JSON keeps a batch far below the size one argument
+        # may have.
+        inline = json.dumps({"pairs": batch}, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"))
+        prompt_text = prose + CONTRACT.format(evidence_name=evidence_path.name,
+                                              evidence=inline)
+        argv = [*base_argv, "--model", model] if model else list(base_argv)
+        transcript = work_dir / f"batch-{index:04d}-try{attempt}.out"
+        remaining = None if deadline is None else max(5.0, deadline - clock())
+        limit = CALL_TIMEOUT_SECONDS if remaining is None else min(
+            CALL_TIMEOUT_SECONDS, remaining + 30)
+        code, seconds = invoke(argv, prompt_text, evidence_path, transcript,
+                               timeout=limit, slot=slot)
+
+        stdout = ""
+        if transcript.is_file():
+            stdout = transcript.read_text(encoding="utf-8", errors="replace")
+        try:
+            document, source = extract_answer(_strip_ansi(stdout), None)
+            accepted, error = validate(document, batch, code_refusals)
+        except TriageRejected as exc:
+            source, accepted, error = "none", None, str(exc)
+
+        with lock:
+            report.cli_exit, report.cli_seconds = code, seconds
             report.attempts += 1
             report.model = model
-
-            stdout = ""
-            if transcript.is_file():
-                stdout = transcript.read_text(encoding="utf-8", errors="replace")
-            try:
-                document, source = extract_answer(_strip_ansi(stdout), None)
-                report.answer_source = source
-                accepted, error = validate(document, batch, code_refusals)
-            except TriageRejected as exc:
-                accepted, error = None, str(exc)
-
+            report.answer_source = source
             if accepted is None:
                 # One bad batch costs one call. Its pairs stay unresolved -- which the
-                # comparator reads as separated -- and the slice moves on to the next
-                # batch. The reason is the validator's own sentence; the transcript,
-                # which holds supplier text, is never printed.
+                # comparator reads as separated -- and the slice moves on. The reason is
+                # the validator's own sentence; the transcript, which holds supplier
+                # text, is never printed.
                 report.status = "rejected"
                 report.error = error
-                report.cli_errors.append(_cli_error(stdout, report.cli_exit))
+                report.cli_errors.append(_cli_error(stdout, code))
                 print(f"batch {index} attempt {report.attempts}: rejected -- {error}",
                       file=sys.stderr)
             else:
-                report.status = "accepted"
-                report.error = ""
                 for entry in accepted:
                     entry["model"] = model
                 result.verdicts.extend(accepted)
                 answered.update(entry["pair_id"] for entry in accepted)
+                complete = all(pair in answered for pair in report.pair_ids)
+                report.status = "accepted" if complete else "rejected"
+                report.error = "" if complete else (
+                    f"{sum(1 for p in report.pair_ids if p not in answered)} pair(s) "
+                    "left unanswered")
                 print(f"batch {index}: {len(accepted)} verdict(s) accepted")
             checkpoint()
+
+    with ThreadPoolExecutor(max_workers=max(1, parallel)) as pool:
+        for attempt in range(MAX_PASSES):
+            waiting = [index for index in sorted(reports)
+                       if reports[index].status in ("deferred", "rejected")]
+            if not waiting or (deadline is not None and clock() >= deadline):
+                break
+            model = chain[attempt % len(chain)]
+            for start in range(0, len(waiting), max(1, parallel)):
+                if deadline is not None and clock() >= deadline:
+                    break
+                wave = waiting[start:start + max(1, parallel)]
+                futures = [pool.submit(ask, index, attempt, model, slot)
+                           for slot, index in enumerate(wave)]
+                for future in futures:
+                    future.result()
 
     checkpoint()
     return result

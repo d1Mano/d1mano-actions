@@ -62,9 +62,18 @@ class Triage(unittest.TestCase):
         self.assertEqual(result.verdicts, [])
         self.assertTrue(all(b.status == "rejected" for b in result.batches))
 
-    def test_a_missing_pair_or_a_free_text_verdict_rejects_the_batch(self):
-        self.assertEqual(self.go(mode="partial", n=2).verdicts, [])
+    def test_a_partial_answer_keeps_what_it_answered_and_leaves_the_rest_open(self):
+        result = self.go(mode="partial", n=2)
+        self.assertEqual([v["pair_id"] for v in result.verdicts], ["PRV_A-001__PRV_B-001"])
+        self.assertEqual(result.unresolved, ["PRV_A-002__PRV_B-002"])
+
+    def test_a_free_text_verdict_rejects_the_batch(self):
         self.assertEqual(self.go(mode="vocab", n=2).verdicts, [])
+
+    def test_parallel_workers_answer_everything_once(self):
+        result = self.go(n=17, parallel=3)
+        ids = [v["pair_id"] for v in result.verdicts]
+        self.assertEqual((len(ids), len(set(ids))), (17, 17))
 
     def test_the_model_cannot_merge_what_code_separated(self):
         refused = [{"pair_id": "PRV_A-001__PRV_B-001", "verdict": "DIFFERENT", "rule": "ADDON_ASYMMETRY"}]
