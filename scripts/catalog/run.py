@@ -64,9 +64,11 @@ RUNS_BUCKET = "catalog-runs"
 READ_BUDGET_SECONDS = 330.0
 WRITE_BUDGET_SECONDS = 150.0
 
-#: How many slices may be spent asking the model before the run moves on with whatever
-#: is still unanswered left separate -- which is the conservative default, and visible.
-MAX_TRIAGE_ROUNDS = 3
+#: How many slices in a row may come back from the model with nothing new before the run
+#: moves on with whatever is still unanswered left separate -- which is the conservative
+#: default, and visible. A slice that made progress does not count: a long queue takes
+#: several slices and that is not a failure. The hard ceiling on slices is the run's own.
+MAX_TRIAGE_STALLS = 2
 
 ITEM_KEY = re.compile(r"^[A-Za-z0-9_-]+-[0-9]{3,6}$")
 SOURCE_SUFFIXES = (".zip", ".txt")
@@ -537,18 +539,19 @@ def consolidate(client: Any, run_id: str, run: Mapping[str, Any], run_dir: Path)
         client.save_pairs(run_id, [verdicts[pair] for pair in sorted(verdicts)])
 
     unresolved = [entry["pair_id"] for entry in queue if entry["pair_id"] not in verdicts]
-    rounds = int(((run.get("result") or {}).get("triage") or {}).get("rounds") or 0) + 1
-    triage = {"pairs": len(queue), "answered": len(verdicts),
-              "unresolved": len(unresolved), "rounds": rounds}
+    before = (run.get("result") or {}).get("triage") or {}
+    progressed = len(verdicts) > int(before.get("answered") or 0)
+    stalls = 0 if progressed else int(before.get("stalls") or 0) + 1
+    triage = {"pairs": len(queue), "answered": len(verdicts), "unresolved": len(unresolved),
+              "rounds": int(before.get("rounds") or 0) + 1, "stalls": stalls}
     client.run_progress(run_id, {"triage": triage})
 
-    if unresolved and rounds < MAX_TRIAGE_ROUNDS:
-        say(f"modelo: quedan {len(unresolved)} pares; se pide otra porción "
-            f"(ronda {rounds} de {MAX_TRIAGE_ROUNDS})")
+    if unresolved and stalls < MAX_TRIAGE_STALLS:
+        say(f"modelo: quedan {len(unresolved)} pares de {len(queue)}; se pide otra porción")
         return False
     if unresolved:
-        # Out of rounds. The unanswered pairs stay separate, which is the safe side of
-        # the default, and the number is in the run for anyone to see.
+        # The model stopped answering. The unanswered pairs stay separate, which is the
+        # safe side of the default, and the number is in the run for anyone to see.
         client.run_event(run_id, "LLM_EXIT_ANOMALY", {"unresolved_pairs": len(unresolved)})
 
     counts = persist_items(client, run_id, kept, dropped, comparison)
