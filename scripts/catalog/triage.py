@@ -11,8 +11,10 @@ supplier-controlled text while an LLM decides what to do with it. Everything els
    holding the database key could act on it. Withholding the key turns that from a
    compromise into a malformed answer the validator refuses.
 2. *No tools.* The evidence is **attached** to the message, so the model needs no file
-   tool to read it, and the CLI is run without auto-approval under a configuration that
-   denies editing, shell and network tools. The model can answer and nothing else.
+   tool to read it, and the CLI runs without auto-approval under a configuration that
+   asks before editing, running a shell or fetching. Nobody is there to say yes, so every
+   such call is rejected. (Denying the tools outright is not an option: the free
+   inference service stops recognising the client and refuses the request.)
 3. *No reach.* The caller may prefix the command (``--cli``) to run it as an unprivileged
    user with an empty environment, so that even a tool call that somehow got through
    cannot touch the code the next step runs with the key.

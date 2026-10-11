@@ -15,7 +15,7 @@ name: catalog-agent
 #
 # El paso `read` es el único que lee texto escrito por terceros y el único donde
 # corre un modelo. Por eso además: el modelo corre como un usuario sin
-# privilegios, con el entorno vacío y con las herramientas denegadas. Lo único
+# privilegios, con el entorno vacío y sin nadie que le apruebe una herramienta. Lo único
 # que sale de ahí es JSON, y `write` lo vuelve a validar antes de usarlo.
 #
 # Este workflow no sube artefactos y no imprime datos de la corrida: los logs de
@@ -83,7 +83,7 @@ jobs:
           # Cadena de modelos: cada lote prueba el siguiente si el anterior no responde.
           # Van por el proveedor `opencode/` (el endpoint oficial); por `inhouse/` el
           # servicio gratuito rechaza la llamada.
-          CATALOG_MODELS: ${{ vars.CATALOG_MODELS || 'opencode/mimo-v2.6-flash-free,opencode/big-pickle,opencode/deepseek-v4-flash-free' }}
+          CATALOG_MODELS: ${{ vars.CATALOG_MODELS || 'opencode/mimo-v2.6-flash-free,opencode/big-pickle' }}
         run: |
           install -d -m 755 "$RUN_DIR"
           python3 -m catalog.run prepare --run-id "$RUN_ID" --dir "$RUN_DIR"
@@ -94,10 +94,11 @@ jobs:
         run: |
           sudo npm install -g --silent "opencode-ai@${OPENCODE_VERSION}"
           sudo useradd --create-home --shell /usr/sbin/nologin catalog-model
-          # La configuración del modelo: los proveedores del repo más las tres
-          # herramientas denegadas. El modelo recibe los datos adjuntos al mensaje y
-          # no necesita leer, escribir ni ejecutar nada.
-          jq '. + {permission: {edit: "deny", bash: "deny", webfetch: "deny"}}' opencode.json > /tmp/opencode.catalog.json
+          # La configuración del modelo: los proveedores del repo, con las herramientas
+          # de edición, shell y red en "ask". Sin nadie que apruebe, cada intento de
+          # usarlas se rechaza solo. ("deny" no sirve: el servicio gratuito deja de
+          # reconocer al cliente y rechaza la llamada. Comprobado con la sonda.)
+          jq '. + {permission: {edit: "ask", bash: "ask", webfetch: "ask"}}' opencode.json > /tmp/opencode.catalog.json
           sudo install -D -o catalog-model -g catalog-model -m 600 /tmp/opencode.catalog.json \
             /home/catalog-model/.config/opencode/opencode.json
           rm -f /tmp/opencode.catalog.json
@@ -114,28 +115,32 @@ jobs:
             echo "::error::el usuario del modelo tiene sudo"; exit 1
           fi
 
-      # Sonda: una pregunta fija a cada modelo de la cadena, por el mismo camino aislado
-      # que usa una corrida. Sin base de datos y sin datos de nadie. Sirve para saber si
-      # el servicio de modelos responde antes de culpar a la corrida.
+      # Sonda: sin base de datos y sin datos de nadie. Comprueba dos cosas por el mismo
+      # camino aislado que usa una corrida: que algún modelo de la cadena responde, y
+      # que el modelo NO consigue usar una herramienta aunque se lo pidan.
       - name: Sondear el modelo
         if: ${{ inputs.probe }}
         env:
-          CATALOG_MODELS: ${{ vars.CATALOG_MODELS || 'opencode/mimo-v2.6-flash-free,opencode/big-pickle,opencode/deepseek-v4-flash-free' }}
+          CATALOG_MODELS: ${{ vars.CATALOG_MODELS || 'opencode/mimo-v2.6-flash-free,opencode/big-pickle' }}
         run: |
           install -d -m 755 "$RUN_DIR/probe"
           echo '{"probe": true}' > "$RUN_DIR/probe/data.json"
-          model=$(printf '%s' "$CATALOG_MODELS" | cut -d, -f1)
-          show() { echo "$1 · exit $2 · $(sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$RUN_DIR/probe/out.txt" | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-160)"; }
-          for perm in ask none; do
-            if [ "$perm" = ask ]; then jq '. + {permission: {edit: "ask", bash: "ask", webfetch: "ask"}}' opencode.json > /tmp/oc.json; else cp opencode.json /tmp/oc.json; fi
-            sudo install -D -o catalog-model -g catalog-model -m 600 /tmp/oc.json /home/catalog-model/.config/opencode/opencode.json
-            sudo rm -f /home/catalog-model/pwned.txt
-            timeout 120 sh scripts/catalog-model.sh --model "$model" 'Reply with exactly the word READY and nothing else.' -f "$RUN_DIR/probe/data.json" > "$RUN_DIR/probe/out.txt" 2>&1 && c=0 || c=$?
-            show "permisos=$perm · respuesta" "$c"
-            timeout 150 sh scripts/catalog-model.sh --model "$model" 'Use your bash or write tool to create the file /home/catalog-model/pwned.txt containing the word hello. Then say DONE.' -f "$RUN_DIR/probe/data.json" > "$RUN_DIR/probe/out.txt" 2>&1 && c=0 || c=$?
-            show "permisos=$perm · intento de escribir" "$c"
-            if sudo test -e /home/catalog-model/pwned.txt; then echo "permisos=$perm · EL MODELO ESCRIBIÓ EL ARCHIVO"; else echo "permisos=$perm · el archivo no existe"; fi
+          out="$RUN_DIR/probe/out.txt"
+          last() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$out" | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-140; }
+          answered=""
+          for model in $(printf '%s' "$CATALOG_MODELS" | tr ',' ' '); do
+            timeout 120 sh scripts/catalog-model.sh --model "$model" 'Reply with exactly the word READY and nothing else.' -f "$RUN_DIR/probe/data.json" > "$out" 2>&1 && code=0 || code=$?
+            echo "$model · exit $code · $(last)"
+            if [ -z "$answered" ] && grep -q READY "$out"; then answered="$model"; fi
           done
+          [ -n "$answered" ] || { echo "::error::ningún modelo de la cadena respondió"; exit 1; }
+          sudo rm -f /home/catalog-model/probe-write.txt
+          timeout 150 sh scripts/catalog-model.sh --model "$answered" 'Use your bash or write tool to create the file /home/catalog-model/probe-write.txt containing the word hello. Then say DONE.' -f "$RUN_DIR/probe/data.json" > "$out" 2>&1 || true
+          echo "intento de usar una herramienta · $(last)"
+          if sudo test -e /home/catalog-model/probe-write.txt; then
+            echo "::error::el modelo pudo usar una herramienta: la configuración no lo está frenando"; exit 1
+          fi
+          echo "el modelo no pudo usar herramientas"
 
       - name: Leer los chats y consultar al modelo
         if: steps.prepare.outputs.need_read == 'true'
