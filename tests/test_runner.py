@@ -71,6 +71,33 @@ class NamesBetweenSuppliers(unittest.TestCase):
         self.assertIsNone(compare.names_contradict("BICICLETA MARCA ONEBOT", "Bicicleta Onebot"))
 
 
+class ModelChain(unittest.TestCase):
+    class Fake:
+        def __init__(self, value): self.value = value
+        def chosen_model(self):
+            if isinstance(self.value, Exception): raise self.value
+            return self.value
+
+    def setUp(self):
+        import os
+        os.environ["CATALOG_MODELS"] = "opencode/a,opencode/b"
+
+    def test_the_owners_model_goes_first_and_fallbacks_stay(self):
+        self.assertEqual(run.model_chain(self.Fake("c")), ["opencode/c", "opencode/a", "opencode/b"])
+        self.assertEqual(run.model_chain(self.Fake("b")), ["opencode/b", "opencode/a"])
+
+    def test_an_unreadable_setting_does_not_stop_the_run(self):
+        self.assertEqual(run.model_chain(self.Fake(RuntimeError("down"))), ["opencode/a", "opencode/b"])
+
+    def test_the_client_refuses_anything_that_is_not_an_identifier(self):
+        class Hostile(postgrest.Client):
+            __slots__ = ()
+            def _rpc(self, *args, **kwargs):
+                return "x; touch /tmp/y"
+        with self.assertRaises(postgrest.DatabaseRefused):
+            Hostile("https://example.invalid", "k").chosen_model()
+
+
 class Commission(unittest.TestCase):
     def test_free_beats_a_value_beats_undeclared(self):
         score = compare.commission_score

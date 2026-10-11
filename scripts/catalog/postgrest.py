@@ -165,6 +165,7 @@ PAGE_ROWS = 1000
 IN_FILTER_CHUNK = 50
 
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
+_MODEL_ID = re.compile(r"^[A-Za-z0-9._-]{2,80}$")
 
 # ── the runner's own event vocabulary ───────────────────────────────────────
 
@@ -226,6 +227,7 @@ RPC_FUNCTIONS = frozenset(
         "agent_catalog_run_progress",
         "agent_catalog_run_finish",
         "agent_catalog_auto_approve",
+        "agent_catalog_model",
     }
 )
 
@@ -1245,6 +1247,17 @@ class Client:
             self._rpc("agent_catalog_auto_approve", {"p_run_id": run_id}),
             "agent_catalog_auto_approve", "to_apply", "returned_to_client",
         )
+
+    def chosen_model(self) -> str:
+        """The model the owner picked for this agent, as a bare identifier.
+
+        The wrapper only ever returns something shaped like an identifier, and it is
+        checked again here: this string becomes one argument of a command.
+        """
+        value = self._rpc("agent_catalog_model", {}, attempts=3)
+        if not isinstance(value, str) or not _MODEL_ID.match(value):
+            raise DatabaseRefused("agent_catalog_model did not return a model identifier")
+        return value
 
     # ── private storage ──
     #

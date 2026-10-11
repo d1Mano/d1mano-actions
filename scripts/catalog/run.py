@@ -180,6 +180,26 @@ def models_from_env() -> list[str]:
     return [part.strip() for part in raw.replace("\n", ",").split(",") if part.strip()]
 
 
+#: The provider every model of the shared catalog is reached through.
+MODEL_PROVIDER = "opencode"
+
+
+def model_chain(client: Any) -> list[str]:
+    """The owner's model first, then the workflow's fallbacks.
+
+    Picking a model must never leave a run without one: if the chosen model is down or
+    was withdrawn, the next pass of the model step moves on to the fallbacks. If the
+    choice cannot even be read, the fallbacks are the chain and the run goes on.
+    """
+    fallbacks = models_from_env()
+    try:
+        chosen = client.chosen_model()
+    except Exception:  # noqa: BLE001 - a missing setting is not a reason to stop a run
+        return fallbacks
+    qualified = chosen if "/" in chosen else f"{MODEL_PROVIDER}/{chosen}"
+    return [qualified, *(model for model in fallbacks if model != qualified)]
+
+
 # ────────────────────────────── prepare ──────────────────────────────
 
 
@@ -216,7 +236,7 @@ def prepare(run_id: str, run_dir: Path) -> int:
         "mode": run.get("mode"),
         "effective_date": run.get("effective_date"),
         "effective_tz": run.get("effective_tz"),
-        "models": models_from_env(),
+        "models": model_chain(client),
     }
     need_read = step <= 2
 
