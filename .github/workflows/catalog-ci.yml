@@ -1,0 +1,33 @@
+name: catalog-ci
+
+# Pruebas del agente de catálogo y chequeo de fugas. Sin secretos: todo lo que
+# corre aquí usa datos sintéticos.
+
+on:
+  push:
+    paths: ["scripts/catalog/**", "scripts/catalog-model.sh", "scripts/check-leak.sh", "tests/**", ".github/workflows/catalog-*.yml"]
+  pull_request:
+    paths: ["scripts/catalog/**", "scripts/catalog-model.sh", "scripts/check-leak.sh", "tests/**", ".github/workflows/catalog-*.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Chequeo de fugas
+        run: bash scripts/check-leak.sh
+      - name: Compilar
+        run: python3 -m compileall -q scripts/catalog
+      - name: Pruebas
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s tests -v

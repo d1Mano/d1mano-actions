@@ -1,0 +1,139 @@
+name: catalog-agent
+
+# Una porción de una corrida del agente de catálogo.
+#
+# Una corrida NO es un job largo: es una cadena de jobs cortos. Cada uno lee de
+# la base en qué punto está la corrida, hace una cantidad acotada de trabajo, lo
+# guarda y, si queda algo, pide el siguiente. Si un job muere, se pierde como
+# mucho lo que tenía entre manos; el resto ya está guardado.
+#
+# ── Quién tiene qué ─────────────────────────────────────────────────────────
+#
+#   prepare  tiene la llave · no tiene modelo
+#   read     tiene el modelo · NO tiene la llave (ni una sola variable SUPABASE_*)
+#   write    tiene la llave · no tiene modelo
+#
+# El paso `read` es el único que lee texto escrito por terceros y el único donde
+# corre un modelo. Por eso además: el modelo corre como un usuario sin
+# privilegios, con el entorno vacío y con las herramientas denegadas. Lo único
+# que sale de ahí es JSON, y `write` lo vuelve a validar antes de usarlo.
+#
+# Este workflow no sube artefactos y no imprime datos de la corrida: los logs de
+# un repositorio público se leen sin iniciar sesión.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Corrida (uuid)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write   # sólo para pedir la porción siguiente
+
+concurrency:
+  group: catalog-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+env:
+  # Ninguna credencial a nivel de job. Las de la base se declaran paso por paso.
+  RUN_ID: ${{ inputs.run_id }}
+  RUN_DIR: /tmp/catalog-run
+  PYTHONPATH: ${{ github.workspace }}/scripts
+  PYTHONDONTWRITEBYTECODE: "1"
+  OPENCODE_VERSION: "1.18.32"
+
+jobs:
+  slice:
+    runs-on: ubuntu-latest
+    # El techo. El trabajo se detiene solo bastante antes (ver los presupuestos en
+    # scripts/catalog/run.py): confiar en este corte es perder lo que estaba en vuelo.
+    timeout-minutes: 12
+
+    steps:
+      - name: Validar la entrada
+        run: |
+          if ! printf '%s' "$RUN_ID" | grep -Eq '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'; then
+            echo "::error::run_id no es un uuid"; exit 1
+          fi
+          echo "::add-mask::$RUN_ID"
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── prepare · con llave, sin modelo ─────────────────────────────────────
+      - name: Reclamar la porción y preparar las fuentes
+        id: prepare
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          CATALOG_MODELS: ${{ vars.CATALOG_MODELS || 'inhouse/big-pickle,inhouse/mimo-v2.6-flash-free,inhouse/deepseek-v4-flash-free' }}
+        run: |
+          install -d -m 755 "$RUN_DIR"
+          python3 -m catalog.run prepare --run-id "$RUN_ID" --dir "$RUN_DIR"
+
+      # ── read · con modelo, sin llave ────────────────────────────────────────
+      - name: Preparar el modelo aislado
+        if: steps.prepare.outputs.need_read == 'true'
+        run: |
+          sudo npm install -g --silent "opencode-ai@${OPENCODE_VERSION}"
+          sudo useradd --create-home --shell /usr/sbin/nologin catalog-model
+          # La configuración del modelo: los proveedores del repo más las tres
+          # herramientas denegadas. El modelo recibe los datos adjuntos al mensaje y
+          # no necesita leer, escribir ni ejecutar nada.
+          jq '. + {permission: {edit: "deny", bash: "deny", webfetch: "deny"}}' opencode.json > /tmp/opencode.catalog.json
+          sudo install -D -o catalog-model -g catalog-model -m 600 /tmp/opencode.catalog.json \
+            /home/catalog-model/.config/opencode/opencode.json
+          rm -f /tmp/opencode.catalog.json
+          # Comprobaciones, no supuestos: el usuario aislado encuentra el CLI, no
+          # puede escribir en el código que `write` va a ejecutar, y no es sudoer.
+          sh scripts/catalog-model.sh --version
+          if sudo -n -u catalog-model test -w "$GITHUB_WORKSPACE/scripts/catalog/run.py"; then
+            echo "::error::el usuario del modelo puede escribir en el código"; exit 1
+          fi
+          if sudo -n -u catalog-model test -w "$RUN_DIR"; then
+            echo "::error::el usuario del modelo puede escribir en el directorio de la corrida"; exit 1
+          fi
+          if sudo -n -u catalog-model sudo -n true 2>/dev/null; then
+            echo "::error::el usuario del modelo tiene sudo"; exit 1
+          fi
+
+      - name: Leer los chats y consultar al modelo
+        if: steps.prepare.outputs.need_read == 'true'
+        run: |
+          if [ "$(env | grep -c '^SUPABASE_' || true)" != "0" ]; then
+            echo "::error::hay credenciales de base de datos en el paso del modelo"; exit 1
+          fi
+          python3 -m catalog.run read --dir "$RUN_DIR" \
+            --cli "sh $GITHUB_WORKSPACE/scripts/catalog-model.sh"
+
+      # ── write · con llave, sin modelo ───────────────────────────────────────
+      - name: Validar, confrontar y aplicar
+        id: write
+        # Corre aunque la lectura haya fallado: es el único paso que puede dejar
+        # dicho en la corrida qué pasó.
+        if: ${{ !cancelled() && steps.prepare.outputs.proceed == 'true' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python3 -m catalog.run write --run-id "$RUN_ID" --dir "$RUN_DIR"
+
+      - name: Pedir la porción siguiente
+        if: ${{ !cancelled() && steps.write.outputs.redispatch == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run catalog-agent.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            -f run_id="$RUN_ID"
+
+      - name: Borrar el directorio de la corrida
+        if: always()
+        run: rm -rf "$RUN_DIR"
