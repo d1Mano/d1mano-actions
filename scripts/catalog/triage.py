@@ -208,14 +208,53 @@ def build_batches(queue: list[dict], size: int) -> list[list[dict]]:
     return [queue[start:start + size] for start in range(0, len(queue), size)]
 
 
-def extract_answer(stdout: str, answer_path: Path | None) -> tuple[dict | None, str]:
-    """Find the model's JSON, and say where it came from.
+def _json_objects(text: str):
+    """Every balanced ``{...}`` span in ``text`` that parses as a JSON object, last first.
 
-    Two sources, tried in order. A file the model was asked to write is the better one --
-    it survives the CLI printing a preamble around it -- and stdout is the fallback for a
-    model that answered in the conversation instead. Both are read; nothing is parsed out
-    of prose, because the moment the extractor starts guessing at JSON it stops being a
-    gate and becomes a second, weaker opinion about the answer.
+    Brace matching that knows about strings, so a ``}`` inside an evidence sentence does
+    not close the object early.
+    """
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"' and depth > 0:
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                spans.append((start, index + 1))
+    for begin, end in reversed(spans):
+        try:
+            document = json.loads(text[begin:end])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(document, dict):
+            yield document
+
+
+def extract_answer(stdout: str, answer_path: Path | None) -> tuple[dict | None, str]:
+    """Find the model's JSON object, and say where it came from.
+
+    Models wrap an answer in whatever they like: a code fence, a sentence before it, the
+    object pretty-printed over forty lines. So the transcript is scanned for complete JSON
+    objects and the last one that carries a ``verdicts`` key is taken. Nothing is repaired
+    and nothing is guessed: a span either parses as JSON or is skipped, and what is found
+    still has to pass ``validate``, which is the gate. This function only locates.
     """
     if answer_path is not None and answer_path.is_file():
         try:
@@ -224,33 +263,13 @@ def extract_answer(stdout: str, answer_path: Path | None) -> tuple[dict | None, 
             raise TriageRejected(f"answer file is not valid JSON: {exc}") from exc
         return (document if isinstance(document, dict) else None), "file"
 
-    # Fenced blocks land at the odd indices of a three-way split. The loop walks every
-    # index rather than stepping by two: the first draft stepped by two from the end and
-    # therefore only ever inspected the *text between* the fences, so a perfectly good
-    # answer was reported as "no JSON answer found".
-    blocks = stdout.split("```")
-    for index in range(len(blocks) - 1, 0, -1):
-        candidate = blocks[index]
-        if candidate.startswith("json"):
-            candidate = candidate[4:]
-        try:
-            document = json.loads(candidate.strip())
-        except json.JSONDecodeError:
-            continue
-        if isinstance(document, dict):
+    fallback: dict | None = None
+    for document in _json_objects(stdout):
+        if "verdicts" in document:
             return document, "stdout"
-    # No fence found. The last resort is the transcript's last line, which is what a model
-    # that answered with a bare object produces. Parsed, never guessed at: if this does not
-    # load, the batch is rejected and the validator says so.
-    tail = stdout.strip().rsplit("\n", 1)[-1].strip()
-    if tail.startswith("{"):
-        try:
-            document = json.loads(tail)
-        except json.JSONDecodeError:
-            return None, "none"
-        if isinstance(document, dict):
-            return document, "tail"
-    return None, "none"
+        if fallback is None:
+            fallback = document
+    return (fallback, "stdout") if fallback is not None else (None, "none")
 
 
 def validate(document: dict | None, batch: list[dict],
@@ -316,14 +335,15 @@ def validate(document: dict | None, batch: list[dict],
     return [seen[pair] for pair in sorted(seen)], ""
 
 
-#: One model call may take this long and no longer. A hung CLI must cost one attempt, not
-#: the slice: the job has a hard ceiling and everything after the model still has to run.
-CALL_TIMEOUT_SECONDS = 210
+#: One model call may take this long and no longer. A hung call must cost one attempt,
+#: not the slice: measured, a batch that is going to be answered is answered in well
+#: under two minutes, and one that is not hangs until it is killed.
+CALL_TIMEOUT_SECONDS = 150
 
-#: How many model attempts one batch may spend across the chain before it is left
-#: unresolved. Free inference endpoints fail per model and per minute; a short chain of
-#: different models recovers far more often than the same model asked twice.
-MAX_ATTEMPTS_PER_BATCH = 3
+#: How many passes over the queue one slice makes. Each pass asks every unanswered batch
+#: once and moves on, so one batch the model cannot digest never starves the ones behind
+#: it; the next pass comes back to it with the next model of the chain.
+MAX_PASSES = 3
 
 DEFAULT_CLI = ("opencode", "run", "--pure")
 
@@ -364,9 +384,10 @@ def run(consolidation: dict, prompt: Path, work_dir: Path, out_path: Path,
         clock=time.monotonic) -> TriageResult:
     """Triage every queued pair, one batch at a time, checkpointing as it goes.
 
-    ``models`` is a chain: each batch tries them in order until one answer validates, up
-    to ``MAX_ATTEMPTS_PER_BATCH``. ``deadline`` is a ``clock()`` instant after which no new
-    call is started; batches not reached stay unresolved and the next slice resumes them.
+    ``models`` is a chain. The queue is walked in passes: each pass asks every unanswered
+    batch once, with one model, and the next pass retries what failed with the next
+    model. ``deadline`` is a ``clock()`` instant after which no new call is started;
+    batches not reached stay ``deferred`` and the next slice resumes them.
     """
     queue = list(consolidation.get("triage_queue") or [])
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -408,41 +429,42 @@ def run(consolidation: dict, prompt: Path, work_dir: Path, out_path: Path,
     base_argv = list(cli or DEFAULT_CLI)
     chain = [m for m in (models or []) if m] or [""]
 
-    for index, batch in enumerate(build_batches(queue, size)):
+    batches = build_batches(queue, size)
+    reports: dict[int, BatchReport] = {}
+    for index, batch in enumerate(batches):
         pair_ids = [entry["pair_id"] for entry in batch]
-        report = BatchReport(index=index, pair_ids=pair_ids, status="pending")
-        result.batches.append(report)
+        done = all(pair in answered for pair in pair_ids)
+        reports[index] = BatchReport(index=index, pair_ids=pair_ids,
+                                     status="skipped" if done else "deferred")
+        result.batches.append(reports[index])
 
-        if all(pair in answered for pair in pair_ids):
-            report.status = "skipped"
-            continue
-        if deadline is not None and clock() >= deadline:
-            report.status = "deferred"
-            report.error = "slice budget reached before this batch"
-            continue
-
-        evidence_path = work_dir / f"batch-{index:04d}.json"
-        evidence_path.write_text(
-            json.dumps({"batch": index, "pairs": batch}, ensure_ascii=False,
-                       indent=1, sort_keys=True),
-            encoding="utf-8",
-        )
-        # The evidence goes in the message itself as well as in the attachment. A model
-        # handed only a file sometimes decides it has to open it, and it has no tool to
-        # open anything with. Compact JSON keeps a batch far below the size one argument
-        # may have.
-        inline = json.dumps({"pairs": batch}, ensure_ascii=False, sort_keys=True,
-                            separators=(",", ":"))
-        prompt_text = prose + CONTRACT.format(evidence_name=evidence_path.name,
-                                              evidence=inline)
-
-        accepted: list[dict] | None = None
-        error = "no attempt was made"
-        for attempt in range(MAX_ATTEMPTS_PER_BATCH):
+    out_of_time = False
+    for attempt in range(MAX_PASSES):
+        waiting = [index for index in sorted(reports)
+                   if reports[index].status in ("deferred", "rejected")]
+        if not waiting or out_of_time:
+            break
+        model = chain[attempt % len(chain)]
+        for index in waiting:
             if deadline is not None and clock() >= deadline:
-                error = "slice budget reached between attempts"
+                out_of_time = True
                 break
-            model = chain[attempt % len(chain)]
+            batch = batches[index]
+            report = reports[index]
+            evidence_path = work_dir / f"batch-{index:04d}.json"
+            evidence_path.write_text(
+                json.dumps({"batch": index, "pairs": batch}, ensure_ascii=False,
+                           indent=1, sort_keys=True),
+                encoding="utf-8",
+            )
+            # The evidence goes in the message itself as well as in the attachment. A
+            # model handed only a file sometimes decides it has to open it, and it has
+            # no tool to open anything with. Compact JSON keeps a batch far below the
+            # size one argument may have.
+            inline = json.dumps({"pairs": batch}, ensure_ascii=False, sort_keys=True,
+                                separators=(",", ":"))
+            prompt_text = prose + CONTRACT.format(evidence_name=evidence_path.name,
+                                                  evidence=inline)
             argv = [*base_argv, "--model", model] if model else list(base_argv)
             transcript = work_dir / f"batch-{index:04d}-try{attempt}.out"
             remaining = None if deadline is None else max(5.0, deadline - clock())
@@ -450,7 +472,7 @@ def run(consolidation: dict, prompt: Path, work_dir: Path, out_path: Path,
                 CALL_TIMEOUT_SECONDS, remaining + 30)
             report.cli_exit, report.cli_seconds = invoke(
                 argv, prompt_text, evidence_path, transcript, timeout=limit)
-            report.attempts = attempt + 1
+            report.attempts += 1
             report.model = model
 
             stdout = ""
@@ -462,26 +484,26 @@ def run(consolidation: dict, prompt: Path, work_dir: Path, out_path: Path,
                 accepted, error = validate(document, batch, code_refusals)
             except TriageRejected as exc:
                 accepted, error = None, str(exc)
-            if accepted is not None:
-                break
-            report.cli_errors.append(_cli_error(stdout, report.cli_exit))
-            # The reason is the validator's own sentence and names at most a pair id;
-            # the transcript, which holds supplier text, is never printed.
-            print(f"batch {index} attempt {attempt + 1}: rejected -- {error}", file=sys.stderr)
 
-        if accepted is None:
-            # One bad batch costs one batch. Every pair in it stays unresolved, which the
-            # comparator reads as separated, and the run continues.
-            report.status = "rejected"
-            report.error = error
-        else:
-            report.status = "accepted"
-            for entry in accepted:
-                entry["model"] = report.model
-            result.verdicts.extend(accepted)
-            answered.update(entry["pair_id"] for entry in accepted)
-            print(f"batch {index}: {len(accepted)} verdict(s) accepted")
-        checkpoint()
+            if accepted is None:
+                # One bad batch costs one call. Its pairs stay unresolved -- which the
+                # comparator reads as separated -- and the slice moves on to the next
+                # batch. The reason is the validator's own sentence; the transcript,
+                # which holds supplier text, is never printed.
+                report.status = "rejected"
+                report.error = error
+                report.cli_errors.append(_cli_error(stdout, report.cli_exit))
+                print(f"batch {index} attempt {report.attempts}: rejected -- {error}",
+                      file=sys.stderr)
+            else:
+                report.status = "accepted"
+                report.error = ""
+                for entry in accepted:
+                    entry["model"] = model
+                result.verdicts.extend(accepted)
+                answered.update(entry["pair_id"] for entry in accepted)
+                print(f"batch {index}: {len(accepted)} verdict(s) accepted")
+            checkpoint()
 
     checkpoint()
     return result

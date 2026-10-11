@@ -18,6 +18,12 @@ if mode == "hang": time.sleep(30)
 if mode == "bad-first-model" and model == "m1":
     print("Error: free tier unavailable"); sys.exit(1)
 ids = [p["pair_id"] for p in pairs]
+if mode == "poison" and "PRV_A-001__PRV_B-001" in ids:
+    print("I could not process this batch."); sys.exit(0)
+if mode == "pretty":
+    print("Here is the answer:\n")
+    print(json.dumps({"verdicts": [{"pair_id": i, "verdict": "same_product", "evidence": "ficha {igual}"} for i in ids]}, indent=2))
+    print("\nHope that helps."); sys.exit(0)
 if mode == "inject": ids = ids + ["PRV_X-001__PRV_Y-001"]
 if mode == "partial": ids = ids[:-1]
 verdict = "banana" if mode == "vocab" else "same_product"
@@ -95,6 +101,19 @@ class Triage(unittest.TestCase):
         finally:
             triage.invoke = real
         self.assertEqual((len(result.verdicts), asked), (4, []))
+
+    def test_a_batch_the_model_cannot_digest_does_not_starve_the_rest(self):
+        result = self.go(n=6, mode="poison")
+        answered = {v["pair_id"] for v in result.verdicts}
+        self.assertEqual(len(answered), 4)                       # batches 1 and 2
+        self.assertNotIn("PRV_A-001__PRV_B-001", answered)
+        self.assertEqual(result.batches[0].status, "rejected")
+        self.assertEqual(result.batches[0].attempts, triage.MAX_PASSES)
+
+    def test_a_pretty_printed_answer_wrapped_in_prose_is_found(self):
+        result = self.go(n=2, mode="pretty")
+        self.assertEqual(len(result.verdicts), 2)
+        self.assertEqual(result.verdicts[0]["evidence"], "ficha {igual}")
 
     def test_refuses_to_start_holding_a_database_variable(self):
         with self.assertRaises(triage.CredentialsPresent):
