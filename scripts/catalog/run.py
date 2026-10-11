@@ -354,6 +354,14 @@ def read(run_dir: Path, cli: list[str] | None = None,
         batches = [{"index": b.index, "status": b.status, "attempts": b.attempts,
                     "cli_exit": b.cli_exit, "error": _logmask.scrub(b.error)[:200]}
                    for b in outcome.batches]
+        for batch in outcome.batches:
+            if batch.status == "rejected":
+                # The validator's sentence and the CLI's own error line: enough to tell a
+                # dead endpoint from a malformed answer, and neither carries supplier text.
+                say(f"  lote {batch.index} rechazado tras {batch.attempts} intentos: "
+                    f"{_logmask.scrub(batch.error)[:160]}")
+                for line in batch.cli_errors:
+                    say(f"    {_logmask.scrub(line)}")
         say(f"modelo: {answered} veredictos nuevos · "
             f"{sum(1 for b in outcome.batches if b.status == 'rejected')} lotes rechazados · "
             f"{sum(1 for b in outcome.batches if b.status == 'deferred')} sin alcanzar")

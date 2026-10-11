@@ -141,6 +141,7 @@ class BatchReport:
     answer_source: str = ""
     attempts: int = 0
     model: str = ""
+    cli_errors: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -443,6 +444,7 @@ def run(consolidation: dict, prompt: Path, work_dir: Path, out_path: Path,
                 accepted, error = None, str(exc)
             if accepted is not None:
                 break
+            report.cli_errors.append(_cli_error(stdout, report.cli_exit))
             # The reason is the validator's own sentence and names at most a pair id;
             # the transcript, which holds supplier text, is never printed.
             print(f"batch {index} attempt {attempt + 1}: rejected -- {error}", file=sys.stderr)
@@ -463,6 +465,19 @@ def run(consolidation: dict, prompt: Path, work_dir: Path, out_path: Path,
 
     checkpoint()
     return result
+
+
+def _cli_error(stdout: str, code: int | None) -> str:
+    """What the CLI itself said went wrong, and nothing the model said.
+
+    Only a line the CLI printed as its own error is kept. The rest of a transcript may
+    quote supplier text back, so it never leaves the run directory.
+    """
+    for line in _strip_ansi(stdout).splitlines():
+        text = line.strip()
+        if text.lower().startswith("error"):
+            return f"exit {code}: {text[:160]}"
+    return f"exit {code}: sin mensaje de error del CLI"
 
 
 _ANSI = None
