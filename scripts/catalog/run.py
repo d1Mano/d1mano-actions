@@ -255,8 +255,12 @@ def prepare(run_id: str, run_dir: Path) -> int:
             local.write_bytes(store.get(RUNS_BUCKET, path))
             sources.append({"provider_key": source["provider_key"], "path": str(local),
                             "label": ""})
+        # ``reference_at`` is when the run was created. A pasted message carries no
+        # year; it is dated against this instant, which is frozen with the run, so every
+        # slice of the run dates the same message the same way.
         write_json(run_dir / "manifest.json",
-                   {"sources": sources, "effective_tz": run.get("effective_tz")})
+                   {"sources": sources, "effective_tz": run.get("effective_tz"),
+                    "reference_at": run.get("created_at")})
 
         # What the model already answered in earlier slices, so it is not asked again.
         write_json(run_dir / "triage.json", {"verdicts": client.read_pairs(run_id)})

@@ -35,7 +35,58 @@ class Identity(unittest.TestCase):
                   [product(uid(1), "Moto Halcon Nova", 1000)])
         targets = [v.product_id for v in out.values() if v.action in ("update", "touch")]
         self.assertEqual(len(targets), 1)
-        self.assertEqual(sorted(v.action for v in out.values()), ["new", "touch"])
+        # The cheaper rival takes the row (R-026). The other is not a new product:
+        # the product exists and a better offer of this same run was chosen for it.
+        self.assertEqual(out[f"{A}-001"].action, "touch")
+        loser = out[f"{A}-002"]
+        self.assertEqual((loser.action, loser.reason, loser.skip_reason),
+                         (None, "outbid_in_run", "CATALOG_OFFER_KEPT"))
+
+
+class NameIdentity(unittest.TestCase):
+    GENERIC = frozenset({"moto", "electrica", "triciclo", "electrico", "bicimoto", "topmaq"})
+
+    def same(self, left, right):
+        score, _ = dbface.name_identity(dbface.identity_words(left),
+                                        dbface.identity_words(right), self.GENERIC)
+        return score is not None
+
+    def test_an_omission_is_not_a_difference(self):
+        self.assertTrue(self.same("TRICICLO ELÉCTRICO KVITOVA PREMIUM", "Triciclo Eléctrico Kvitova"))
+        self.assertTrue(self.same("Planta marca Pulsar", "Planta Eléctrica Pulsar 10000W"))
+        self.assertTrue(self.same("BICICLETA ELÉCTRICA MARCA ONEBOT 2026", "Bicicleta Eléctrica Onebot"))
+
+    def test_a_contradiction_is(self):
+        self.assertFalse(self.same("MOTO ELÉCTRICA TOPMAQ TANK", "Moto Eléctrica Topmaq F3"))
+        self.assertFalse(self.same("MOTICO ORIS", "MOTICO MAF"))
+        self.assertFalse(self.same("BICIMOTO JMD 2026", "Patineta Eléctrica JMD"))
+        self.assertFalse(self.same("MOTO ELÉCTRICA TANK", "Moto Automática Tank"))
+        self.assertFalse(self.same("Bicicleta Eléctrica A12", "Bicicleta Eléctrica A9"))
+
+    def test_sharing_only_generic_words_identifies_nothing(self):
+        self.assertFalse(self.same("MOTO ELÉCTRICA TOPMAQ", "Moto Eléctrica Topmaq F3"))
+
+    def test_misspellings_are_one_word_but_similar_words_are_not(self):
+        self.assertTrue(self.same("BICIMOTO YOAZAKY 707", "Bicimoto Yoazaki 707"))
+        self.assertTrue(self.same("MOTO DE GASOLINA KATZU SNAPDRAGON", "Moto de Gasolina Katsu Snapdragon"))
+        self.assertTrue(self.same("TRICICLO TRACKTION", "Triciclo Traktion 2026"))
+        self.assertFalse(self.same("Cuatriciclo eléctrico Bryderk", "Triciclo Eléctrico Bryderk"))
+
+    def test_a_short_name_inside_a_long_one_is_not_enough(self):
+        self.assertFalse(self.same(
+            "Inversor dos en uno Must de 3kw y batería de 7kwh", "Batería Marca Must"))
+
+    def test_add_on_in_one_name_only_is_another_product(self):
+        out = run([offer(f"{A}-001", "Triciclo Jinpeng con cabina", 4680)],
+                  [product(uid(1), "Triciclo Jinpeng", 3900, provider=B, hours_ago=90)])
+        self.assertEqual(out[f"{A}-001"].action, "new")
+
+    def test_rivals_for_one_row_are_settled_by_price(self):
+        out = run([offer(f"{A}-001", "Moto Halcon Nova", 1100),
+                   offer(f"{B}-001", "Moto Halcon Nova", 1000, provider=B)],
+                  [product(uid(1), "Moto Halcon Nova", 1200, provider="PRV_CCCCCCCC", hours_ago=5)])
+        self.assertEqual(out[f"{B}-001"].action, "update")
+        self.assertEqual(out[f"{A}-001"].reason, "outbid_in_run")
 
 
 class SameSupplier(unittest.TestCase):

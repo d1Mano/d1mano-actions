@@ -54,3 +54,7 @@ YEAR_PREV_CENTURY = 1900
 # provider key that may itself contain underscores.
 ORDINAL_MIN_DIGITS = 3
 ORDINAL_MAX_DIGITS = 6
+#: The day/month order a chat is read in when nothing in it proves one and both
+#: readings are possible. Verified against real exports from this market: every chat
+#: that carried proof proved day-first. A chat that proves otherwise overrides it.
+DEFAULT_FIELD_ORDER = "d/m"

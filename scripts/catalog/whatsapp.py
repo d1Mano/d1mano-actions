@@ -64,7 +64,8 @@ HEADER_RE = re.compile(r"^\s*-\s*([^:]{0,60}):(.*)$", re.S)
 # Same intent as the legacy parser's name picker. The bar is length: a
 # line that is mostly advertising does not become a product name.
 PROMO_WORDS = re.compile(
-    r"\b(solo|quedan?|disponible|nuevo|lote|mes|uso|detalles|recien|llegad\w*)\b", re.I)
+    r"\b(solo|quedan?|disponibles?|nuev[oa]s?|lote|mes|uso|detalles|recien|llegad\w*|"
+    r"rebajas?|ofertas?|super|s[uú]per|promo\w*|presio|precio|de)\b", re.I)
 
 PRICE_LINE = re.compile(
     r"(?:presio|precio|pres|price)\s*(?:el[eé]ctrico|hibrido|h[ií]brido|de\s*carga)?"
@@ -76,12 +77,47 @@ PRICE_CTX = re.compile(
     r"sin\s+(?:techo|extensor|mensajer[ií]a|cabina)[a-z\sà-ÿ]*|"
     r"el[eé]ctrico|h[ií]brido|de\s*carga)", re.I)
 
-COMMISSION_LINE = re.compile(r"com[ií]s[ií][oó]n|com[ií]ci[oó]n", re.I)
+# "comision", "comición" and the truncated "comion" all occur in real captions.
+COMMISSION_LINE = re.compile(r"com[ií](?:s[ií]|c[ií])?[oó]n", re.I)
 COMMISSION_FREE = re.compile(r"com(?:is[ií]|i[oó]ci)[oó]n\s*libre", re.I)
 # "50 de comisión" reads the number *before* the keyword, which is why the cascades
 # are three and not one.
 COMMISSION_INVERTED = re.compile(
-    r"(\d{1,5})\s*de\s*(?:com[ií]s[ií][oó]n|com[ií]ci[oó]n)", re.I)
+    r"(\d{1,5})\s*(?:usd|cup|eur|mn|\$)?\s*(?:de\s*)?com[ií](?:s[ií]|c[ií])?[oó]n", re.I)
+
+# A price written with no keyword at all: the amount opens the line and is followed by a
+# currency, a parenthesised commission, or both -- "600 USD (10USD COMISIÓN)",
+# "55(4 usd comisión)x unidad", "$1200". Consulted only for a caption in which no line
+# says "precio", so a caption that does is read exactly as before. The currency or the
+# commission is required: a bare number opening a line is a specification, not a price.
+BARE_PRICE_LINE = re.compile(
+    r"^\s*(?:\$\s*)?((?:\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\d{1,2})?)\s*"
+    r"(?:(?:usd|cup|eur|mn)\b|\$|(?=\([^)]*com))",
+    re.I)
+
+
+def price_matches(line: str, bare: bool) -> list[re.Match]:
+    """The prices one line states. ``bare`` admits the keyword-less shape."""
+    found = list(PRICE_LINE.finditer(line))
+    if found or not bare:
+        return found
+    match = BARE_PRICE_LINE.match(line)
+    return [match] if match else []
+
+
+def is_price_line(line: str, bare: bool) -> bool:
+    return bool(price_matches(line, bare))
+
+
+def uses_bare_prices(text: str) -> bool:
+    """True when the caption states its price without ever saying "precio"."""
+    return not PRICE_LINE.search(text) and any(
+        BARE_PRICE_LINE.match(line) for line in text.splitlines())
+
+
+def has_price(text: str) -> bool:
+    """Does this caption announce something for sale?"""
+    return bool(PRICE_LINE.search(text)) or uses_bare_prices(text)
 
 ZERO_WIDTH = str.maketrans("", "", "‎‏‪‫‬‭‮⁦⁧⁨⁩")
 
@@ -140,30 +176,40 @@ def parse_messages(chat_path: Path) -> list[Message]:
     messages: list[Message] = []
     with chat_path.open("r", encoding="utf-8", errors="replace") as handle:
         for line_number, line in enumerate(handle, start=1):
-            stripped = line.rstrip("\n")
-            match = dates.TIMESTAMP_RE.match(stripped)
-            if match:
-                remainder = stripped[match.end():]
-                header = HEADER_RE.match(remainder)
-                if header:
-                    sender = header.group(1).strip()
-                    body = header.group(2)
+            stripped = line.rstrip("\n").lstrip("\ufeff")
+            matched = dates.match_header(stripped)
+            if matched:
+                fields, remainder, style = matched
+                if style == dates.STYLE_COPIED:
+                    # ``Sender: caption``. The sender of a copied message is a phone
+                    # number or a contact name; it is not kept, only split off.
+                    sender_end = remainder.find(":")
+                    if 0 <= sender_end <= 60:
+                        sender, body = remainder[:sender_end].strip(), remainder[sender_end + 1:]
+                    else:
+                        sender, body = "", remainder
                 else:
-                    # A system notice. It carries a real date -- and on this corpus it
-                    # is the date that proves the field order -- but nobody sent it and
-                    # it announces no product.
-                    sender = ""
-                    body = remainder
+                    header = HEADER_RE.match(remainder)
+                    if header:
+                        sender = header.group(1).strip()
+                        body = header.group(2)
+                    else:
+                        # A system notice. It carries a real date and may be the line
+                        # that proves the field order, but nobody sent it and it
+                        # announces no product.
+                        sender = ""
+                        body = remainder
+                first, second, year, hour, minute, meridiem = fields
                 messages.append(
                     Message(
                         stamp=dates.Stamp(
                             raw=stripped[:120],
-                            first=int(match.group(1)),
-                            second=int(match.group(2)),
-                            year_two_digit=int(match.group(3)),
-                            hour=int(match.group(4)),
-                            minute=int(match.group(5)),
-                            meridiem=(match.group(6) or "").lower(),
+                            first=first,
+                            second=second,
+                            year_two_digit=year,
+                            hour=hour,
+                            minute=minute,
+                            meridiem=meridiem,
                             sender=sender,
                             line_number=line_number,
                         )
@@ -188,14 +234,17 @@ def parse_messages(chat_path: Path) -> list[Message]:
 
 
 def pick_name(lines: list[str]) -> str:
-    """First caption line that carries product information rather than advertising."""
+    """First caption line that names the product rather than advertising or pricing it."""
+    bare = uses_bare_prices("\n".join(lines))
     for line in lines:
+        if is_price_line(line, bare):
+            continue
         candidate = re.sub(r"^[•·\-–—\s]+", "", clean_name(line)).strip()
         if not candidate:
             continue
-        stripped = PROMO_WORDS.sub(" ", candidate).strip(" ¡!-–—:.")
+        stripped = re.sub(r"\s+", " ", PROMO_WORDS.sub(" ", candidate)).strip(" ¡!-–—:.")
         if len(stripped) >= 4:
-            return re.sub(r"\bdisponible\b", "", candidate, flags=re.I).strip(" -–—:.")
+            return re.sub(r"\bdisponibles?\b", "", candidate, flags=re.I).strip(" -–—:.")
     return clean_name(lines[0]) if lines else ""
 
 
@@ -211,19 +260,53 @@ def _to_float(raw: str) -> float:
     return float(raw.replace(",", "."))
 
 
+# The variant phrases that may sit on a line of their own *between* two prices of one
+# caption: "Con extensor de rango" above the second "Precio:". Narrower than
+# ``PRICE_CTX`` on purpose -- "eléctrico" and "de carga" appear in almost every product
+# name, and reading them off a neighbouring line would label every second price.
+VARIANT_LINE = re.compile(
+    r"\b(con\s+(?:extensor|expansor|techo|cabina|panel|inversor|mensajer[ií]a)[a-z\sà-ÿ]*|"
+    r"sin\s+(?:techo|extensor|mensajer[ií]a|cabina)[a-z\sà-ÿ]*)", re.I)
+
+
 def extract_prices(text: str) -> list[dict]:
-    """Every price in the caption, each with the variant context on its own line."""
+    """Every price in the caption, each with its variant context and its own commission.
+
+    The context is read off the price's own line when it is there ("Precio con extensor:
+    3950"). For the second and later prices of a caption it may instead sit on a line by
+    itself just above ("Con extensor de Rango" / "Precio: 3950"), so the lines since the
+    previous price are searched too. The first price never looks back: everything above
+    it is the product's own description.
+
+    The commission works the other way round: it is stated on the price's line or on the
+    lines right after it, up to the next price. A caption offering "3630, comisión 50"
+    and "3580, comisión 25" is offering two deals, and reading the first commission for
+    both would publish the cheaper price with the dearer deal's commission.
+    """
+    bare = uses_bare_prices(text)
     prices: list[dict] = []
+    since_last: list[str] = []
     for line in text.splitlines():
-        for match in PRICE_LINE.finditer(line):
+        matches = price_matches(line, bare)
+        if not matches:
+            since_last.append(line)
+            if prices:
+                prices[-1]["_after"].append(line)
+            continue
+        for match in matches:
             context_match = PRICE_CTX.search(line)
-            prices.append(
-                {
-                    "value": _to_float(match.group(1)),
-                    "raw": line.strip(),
-                    "context": context_match.group(0).strip().lower() if context_match else "",
-                }
-            )
+            context = context_match.group(0).strip().lower() if context_match else ""
+            if not context and prices:
+                for earlier in reversed(since_last):
+                    found = VARIANT_LINE.search(earlier)
+                    if found:
+                        context = found.group(0).strip().lower()
+                        break
+            prices.append({"value": _to_float(match.group(1)), "raw": line.strip(),
+                           "context": context, "_after": [line[match.end():]]})
+        since_last = []
+    for price in prices:
+        price["commission"] = extract_commission("\n".join(price.pop("_after")))
     return prices
 
 

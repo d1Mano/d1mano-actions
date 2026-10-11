@@ -69,6 +69,78 @@ TIMESTAMP_RE = re.compile(
     re.I,
 )
 
+# The second shape a chat arrives in: messages selected and **copied** out of WhatsApp
+# and pasted as one block. It is what the owner actually does, because exporting a chat
+# is slow and drags the media along. Each message then starts with a bracketed stamp:
+#
+#     [10/10 9:29 a. m.] +53 5 0000000: caption
+#     [9:29 a. m., 10/10/2026] Name: caption        (other phone locales)
+#
+# The year is usually absent. It is recovered from the run's own reference instant --
+# see ``to_datetime`` -- never from today's clock.
+COPIED_DATE_FIRST_RE = re.compile(
+    r"^\[(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?,?\s+"
+    r"(\d{1,2}):(\d{2})(?:\s*([ap])\.?\s*m\.?)?\s*\]\s*",
+    re.I,
+)
+COPIED_TIME_FIRST_RE = re.compile(
+    r"^\[(\d{1,2}):(\d{2})(?:\s*([ap])\.?\s*m\.?)?,\s*"
+    r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\s*\]\s*",
+    re.I,
+)
+_EXPORT_SENDER_RE = re.compile(r"^\s*-\s*[^:]{0,60}:\s?")
+
+#: ``Stamp.year_two_digit`` when the stamp carries no year at all.
+NO_YEAR = -1
+
+STYLE_EXPORT = "export"
+STYLE_COPIED = "copied"
+
+
+def _copied(line: str) -> tuple[tuple, str] | None:
+    match = COPIED_DATE_FIRST_RE.match(line)
+    if match:
+        first, second, year, hour, minute, meridiem = match.groups()
+    else:
+        match = COPIED_TIME_FIRST_RE.match(line)
+        if not match:
+            return None
+        hour, minute, meridiem, first, second, year = match.groups()
+    fields = (int(first), int(second), NO_YEAR if year is None else int(year) % 100,
+              int(hour), int(minute), (meridiem or "").lower())
+    return fields, line[match.end():]
+
+
+def match_header(line: str) -> tuple[tuple, str, str] | None:
+    """Recognise a message header in either shape.
+
+    Returns ``(fields, remainder, style)`` where ``fields`` is
+    ``(first, second, year_two_digit, hour, minute, meridiem)`` and ``remainder`` is what
+    follows the stamp -- ``" - Sender: caption"`` for an export, ``"Sender: caption"`` for
+    a copied block -- or ``None`` when the line starts no message.
+
+    One nesting is unwrapped: an exported chat whose message *is* a pasted block starts
+    with an export stamp immediately followed by a copied one. The inner stamp is when
+    the supplier announced the product; the outer one is only when somebody forwarded
+    it, so the inner one wins.
+    """
+    copied = _copied(line)
+    if copied is not None:
+        return copied[0], copied[1], STYLE_COPIED
+    match = TIMESTAMP_RE.match(line)
+    if not match:
+        return None
+    remainder = line[match.end():]
+    sender = _EXPORT_SENDER_RE.match(remainder)
+    if sender:
+        inner = _copied(remainder[sender.end():])
+        if inner is not None:
+            return inner[0], inner[1], STYLE_COPIED
+    fields = (int(match.group(1)), int(match.group(2)), int(match.group(3)) % 100,
+              int(match.group(4)), int(match.group(5)), (match.group(6) or "").lower())
+    return fields, remainder, STYLE_EXPORT
+
+
 DAY_FIRST = "d/m"
 MONTH_FIRST = "m/d"
 
@@ -112,6 +184,8 @@ class DateOrder:
     proving_stamps: tuple[Stamp, ...] = field(default=())
     ambiguous_stamps: int = 0
     ignored_stamps: int = 0
+    #: How the order was settled when no stamp proved it. Empty when one did.
+    fallback: str = ""
 
     def evidence_payload(self) -> dict:
         """The shape written into each product's payload (R-004's inspectability).
@@ -121,7 +195,7 @@ class DateOrder:
         """
         return {
             "field_order": self.order,
-            "rule": (
+            "rule": self.fallback or (
                 "first field exceeds 12, so the chat is day-first"
                 if self.order == DAY_FIRST
                 else "second field exceeds 12, so the chat is month-first"
@@ -158,18 +232,20 @@ def scan_stamps(chat_path: Path) -> list[Stamp]:
     stamps: list[Stamp] = []
     with chat_path.open("r", encoding="utf-8", errors="replace") as handle:
         for line_number, line in enumerate(handle, start=1):
-            match = TIMESTAMP_RE.match(line.rstrip("\n"))
-            if not match:
+            text = line.rstrip("\n").lstrip("\ufeff")
+            header = match_header(text)
+            if header is None:
                 continue
+            first, second, year, hour, minute, meridiem = header[0]
             stamps.append(
                 Stamp(
-                    raw=line.rstrip("\n")[:120],
-                    first=int(match.group(1)),
-                    second=int(match.group(2)),
-                    year_two_digit=int(match.group(3)),
-                    hour=int(match.group(4)),
-                    minute=int(match.group(5)),
-                    meridiem=(match.group(6) or "").lower(),
+                    raw=text[:120],
+                    first=first,
+                    second=second,
+                    year_two_digit=year,
+                    hour=hour,
+                    minute=minute,
+                    meridiem=meridiem,
                     sender="",
                     line_number=line_number,
                 )
@@ -181,11 +257,32 @@ def _describe(stamp: Stamp) -> str:
     return f"{stamp.raw!r} (line {stamp.line_number})"
 
 
-def resolve_order(stamps: list[Stamp]) -> DateOrder:
-    """Establish the chat's day/month order, or refuse to.
+def _fits(stamps: list[Stamp], order: str, reference: datetime | None) -> bool:
+    """Is every stamp a real date, not in the future, when read under ``order``?"""
+    for stamp in stamps:
+        try:
+            moment = to_datetime(stamp, order, reference)
+        except DateRejected:
+            return False
+        if reference is not None and moment > reference.replace(tzinfo=None) + _FUTURE_SLACK:
+            return False
+    return True
 
-    ``stamps`` must be non-empty: a chat with no parseable timestamp has no products
-    either, and the caller hits that before reaching here.
+
+def resolve_order(stamps: list[Stamp], reference: datetime | None = None) -> DateOrder:
+    """Establish the chat's day/month order, with the evidence for it.
+
+    Proof first: a stamp whose first field exceeds 12 proves day-first, one whose second
+    does proves month-first, and a chat that proves both is refused -- two locales were
+    merged and every date in it would be a coin flip.
+
+    When nothing proves it -- a pasted block of this week's messages often carries no
+    day above 12 -- the order is settled by elimination against ``reference``, the instant
+    the run was created: a reading that puts a message in the future, or on a date that
+    does not exist, is not a reading. If that leaves one order, it is the answer and the
+    payload says why. If it leaves both, the deployment's declared order
+    (``limits.DEFAULT_FIELD_ORDER``) is used and the payload says *that*, so a date read
+    on a default is never mistaken for one read on proof.
     """
     day_first = [stamp for stamp in stamps if _classify(stamp) == DAY_FIRST]
     month_first = [stamp for stamp in stamps if _classify(stamp) == MONTH_FIRST]
@@ -194,28 +291,40 @@ def resolve_order(stamps: list[Stamp]) -> DateOrder:
         raise DateRejected(
             "this chat proves both field orders, so no single reading is trustworthy: "
             f"day-first at {_describe(day_first[0])}, month-first at "
-            f"{_describe(month_first[0])}. It looks like exports from two locales were "
-            "merged; re-export the chat as one file"
+            f"{_describe(month_first[0])}. It looks like text from two phone locales was "
+            "mixed; paste each supplier's messages from one phone"
         )
 
     unusable = sum(1 for stamp in stamps if stamp.first > 12 and stamp.second > 12)
-    if not day_first and not month_first:
-        samples = ", ".join(_describe(stamp) for stamp in stamps[:3])
-        raise DateRejected(
-            f"no timestamp in this chat settles the field order; all {len(stamps)} are "
-            f"ambiguous (e.g. {samples}). Both readings are open: {DAY_FIRST} would read "
-            f"{_reading(stamps[0], DAY_FIRST)} and {MONTH_FIRST} would read "
-            f"{_reading(stamps[0], MONTH_FIRST)}. Refusing to pick"
+    ambiguous = sum(1 for stamp in stamps if stamp.first <= 12 and stamp.second <= 12)
+
+    if day_first or month_first:
+        return DateOrder(
+            order=DAY_FIRST if day_first else MONTH_FIRST,
+            proving_stamps=tuple((day_first or month_first)[:5]),
+            ambiguous_stamps=ambiguous,
+            ignored_stamps=unusable,
         )
 
-    order = DAY_FIRST if day_first else MONTH_FIRST
-    proof = (day_first or month_first)[:5]
-    ambiguous = sum(1 for stamp in stamps if stamp.first <= 12 and stamp.second <= 12)
+    usable = [stamp for stamp in stamps if not (stamp.first > 12 and stamp.second > 12)]
+    candidates = [order for order in (DAY_FIRST, MONTH_FIRST)
+                  if _fits(usable, order, reference)]
+    if not candidates:
+        samples = ", ".join(_describe(stamp) for stamp in stamps[:3])
+        raise DateRejected(
+            f"no reading of these dates is possible: under either field order some "
+            f"message is in the future or on a date that does not exist (e.g. {samples})"
+        )
+    if len(candidates) == 1:
+        return DateOrder(
+            order=candidates[0], ambiguous_stamps=ambiguous, ignored_stamps=unusable,
+            fallback=("no stamp proves the field order; the other reading puts a message "
+                      "in the future or on an impossible date"),
+        )
     return DateOrder(
-        order=order,
-        proving_stamps=tuple(proof),
-        ambiguous_stamps=ambiguous,
-        ignored_stamps=unusable,
+        order=limits.DEFAULT_FIELD_ORDER, ambiguous_stamps=ambiguous, ignored_stamps=unusable,
+        fallback=("no stamp proves the field order and both readings are possible; "
+                  f"read as {limits.DEFAULT_FIELD_ORDER}, the declared format"),
     )
 
 
@@ -227,16 +336,38 @@ def expand_year(two_digit: int) -> int:
 
 def _reading(stamp: Stamp, order: str) -> str:
     day, month = (stamp.first, stamp.second) if order == DAY_FIRST else (stamp.second, stamp.first)
-    return f"{day}/{month}/{stamp.year_two_digit}"
+    year = "" if stamp.year_two_digit == NO_YEAR else f"/{stamp.year_two_digit}"
+    return f"{day}/{month}{year}"
 
 
-def to_datetime(stamp: Stamp, order: str) -> datetime:
+#: A message may be stamped slightly after the run's reference instant (clock skew
+#: between phones, a paste made seconds before midnight). Past this it is the future.
+_FUTURE_SLACK = timedelta(days=1)
+
+
+def _apply_meridiem(moment: datetime, meridiem: str) -> datetime:
+    # 12:00 a.m. is midnight and 12:00 p.m. is noon, so the hour wraps before the
+    # addition rather than after it.
+    if meridiem == "p" and moment.hour < 12:
+        return moment + timedelta(hours=12)
+    if meridiem == "a" and moment.hour == 12:
+        return moment - timedelta(hours=12)
+    return moment
+
+
+def to_datetime(stamp: Stamp, order: str, reference: datetime | None = None) -> datetime:
     """Resolve one stamp to a naive local datetime under ``order``.
 
     Invalid calendar dates raise ``DateRejected`` rather than falling back to a
-    default: a stamp of ``31/2/26`` means the export is damaged or the text is not a
-    timestamp, and guessing February 28 would put a product a day off in a filter
-    whose whole job is to be exact.
+    default: a stamp of ``31/2`` means the text is damaged or is not a timestamp, and
+    guessing February 28 would put a product a day off in a filter whose whole job is to
+    be exact.
+
+    A copied stamp has no year. It takes the year of ``reference`` -- the instant the
+    run was created, frozen with the run -- or the year before when that would land it
+    in the future (a December message pasted in January). Without a reference such a
+    stamp cannot be dated and says so; today's clock is never consulted, because a
+    replayed slice would then date the same message differently.
     """
     day, month = (stamp.first, stamp.second) if order == DAY_FIRST else (stamp.second, stamp.first)
     if not 1 <= month <= 12:
@@ -245,20 +376,34 @@ def to_datetime(stamp: Stamp, order: str) -> datetime:
             f"the {DAY_FIRST} reading would be {_reading(stamp, DAY_FIRST)} and the "
             f"{MONTH_FIRST} reading {_reading(stamp, MONTH_FIRST)}"
         )
+
+    if stamp.year_two_digit == NO_YEAR:
+        if reference is None:
+            raise DateRejected(
+                f"{_describe(stamp)} carries no year and no reference instant was given "
+                "to recover it from"
+            )
+        local = reference.replace(tzinfo=None)
+        last: ValueError | None = None
+        for year in (local.year, local.year - 1):
+            try:
+                moment = _apply_meridiem(
+                    datetime(year, month, day, stamp.hour, stamp.minute), stamp.meridiem)
+            except ValueError as exc:      # 29/2 outside a leap year
+                last = exc
+                continue
+            if moment <= local + _FUTURE_SLACK:
+                return moment
+        raise DateRejected(
+            f"{_describe(stamp)} is not a date at or before the run's reference under "
+            f"{order}" + (f": {last}" if last else "")
+        )
+
     try:
         naive = datetime(expand_year(stamp.year_two_digit), month, day, stamp.hour, stamp.minute)
     except ValueError as exc:
         raise DateRejected(f"{_describe(stamp)} is not a real date under {order}: {exc}") from exc
-
-    if stamp.meridiem == "p":
-        # 12:00 a.m. is midnight and 12:00 p.m. is noon, so the hour wraps before the
-        # addition rather than after it.
-        if naive.hour < 12:
-            naive += timedelta(hours=12)
-    elif stamp.meridiem == "a":
-        if naive.hour == 12:
-            naive -= timedelta(hours=12)
-    return naive
+    return _apply_meridiem(naive, stamp.meridiem)
 
 
 def load_zone(name: str) -> ZoneInfo:
@@ -276,6 +421,12 @@ def load_zone(name: str) -> ZoneInfo:
         ) from exc
 
 
-def localize(stamp: Stamp, order: str, zone: ZoneInfo) -> datetime:
-    """The stamp as an aware instant, which is what ``run_items.observed_at`` holds."""
-    return to_datetime(stamp, order).replace(tzinfo=zone)
+def localize(stamp: Stamp, order: str, zone: ZoneInfo,
+             reference: datetime | None = None) -> datetime:
+    """The stamp as an aware instant, which is what ``run_items.observed_at`` holds.
+
+    ``reference`` is an aware instant; it is moved into ``zone`` first, because "the
+    current year" is a property of the wall clock the messages were written against.
+    """
+    local = None if reference is None else reference.astimezone(zone)
+    return to_datetime(stamp, order, local).replace(tzinfo=zone)

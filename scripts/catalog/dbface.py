@@ -11,10 +11,11 @@ inserted (R-011).
 
 Three questions, in this order, and the order is the safety property
 --------------------------------------------------------------------
-1. **Is it the same product?** Name similarity proposes; an explicit disagreement
-   disposes. A measurement that differs in the name, a categorical property that
-   contradicts, a declared quantity that does not agree -- any of these means *not the
-   same product*, and the candidate is dropped. The default is separation (R-024): a
+1. **Is it the same product?** Decided on the words of the two names, not on how
+   alike they look: an omission is not a difference, a contradiction is (see "Name
+   identity" below). Then a measurement that differs, a categorical property that
+   contradicts, a declared quantity that does not agree, an add-on on one side only --
+   any of these also means *not the same product*, and the candidate is dropped. The default is separation (R-024): a
    wrong merge overwrites a published product with another one's price, a wrong split
    only sends a product back to the owner as new.
 2. **Whose offer is it?** The same supplier re-announcing its own product is not a
@@ -307,12 +308,14 @@ REASON_COMMISSION_TIE = "commission_tie"    # another supplier, same price, bett
 REASON_CATALOG_BETTER = "catalog_better"    # another supplier, and the catalog still wins
 REASON_NO_PRICE = "no_price"                # the offer carries no price to compete with
 REASON_IMPLAUSIBLE = "implausible_price"    # the move looks like a parsing accident
+REASON_OUTBID = "outbid_in_run"              # another offer of this run took the row
 REASON_NO_MATCH = "no_match"
 
 SKIP_CATALOG_KEPT = "CATALOG_OFFER_KEPT"
 SKIP_IMPLAUSIBLE = "IMPLAUSIBLE_PRICE"
 
-#: How similar two names must be before the pair is even scored.
+#: How alike two names must look before a refused pairing is worth mentioning to the
+#: owner as "nearly this one". It decides nothing: identity is ``name_identity``.
 CATALOG_FLOOR = 0.55
 
 
@@ -476,42 +479,199 @@ def identity_clash(view: ProductView, entry: CatalogEntry) -> str | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Name identity
+# ---------------------------------------------------------------------------
+#
+# A character-overlap score cannot tell a product from its neighbour in the same
+# category. Two motorcycles of one brand share most of their letters and differ in the
+# only word that matters -- the model. Measured on real offers, an overlap floor of 0.55
+# paired a product with a *different* model in roughly one match out of six, each of
+# which would have overwritten somebody else's price.
+#
+# So names are compared as sets of words, and the rule is the same one R-024 states for
+# properties: **an omission is not a difference; a contradiction is.**
+#
+# * If every word of one name appears in the other, the longer name only says more
+#   about the same thing ("Kvitova" / "Kvitova Premium"): same product.
+# * If each name has a word the other lacks ("Topmaq Tank" / "Topmaq F3"), they
+#   contradict: different products.
+# * And the names must share at least one word that is not generic to the whole
+#   catalog. "Moto Eléctrica" alone identifies nothing.
+
+#: Words that decorate a name without saying which product it is.
+NAME_NOISE = frozenset({
+    "marca", "nuevo", "nueva", "nuevos", "nuevas", "original", "originales", "0km",
+    "km", "caja", "oferta", "disponible", "modelo", "tipo",
+})
+
+#: A word is generic when at least this share of all names in play uses it. Derived
+#: from the names themselves at run time, so no category or brand list lives here.
+GENERIC_SHARE = 0.05
+
+#: Two spelled-out words are one word misspelt when they are within this many single
+#: letter edits: one for a short word ("katzu"/"katsu"), two for a long one
+#: ("prontezza"/"protenzza"). Counted in edits rather than as a similarity ratio because
+#: a ratio calls "cuatriciclo" and "triciclo" the same word. Words carrying a digit are
+#: model numbers and must match exactly: "a12" is not "a9".
+FUZZY_MIN_LENGTH = 5
+FUZZY_LONG_LENGTH = 8
+
+#: Below this share of words in common, a name that merely *contains* a shorter one is
+#: not the same product: "Batería Must" is inside the name of an inverter that ships
+#: with a Must battery.
+IDENTITY_FLOOR = 0.5
+
+
+def identity_words(name: str) -> tuple[str, ...]:
+    """The words of a name that take part in identity, sorted."""
+    return tuple(sorted({token for token in _compare.name_tokens(name)
+                         if token not in NAME_NOISE}))
+
+
+def _edits(left: str, right: str, limit: int) -> int:
+    """Levenshtein distance, abandoned once it is certain to exceed ``limit``."""
+    if abs(len(left) - len(right)) > limit:
+        return limit + 1
+    previous = list(range(len(right) + 1))
+    for i, a in enumerate(left, start=1):
+        current = [i]
+        for j, b in enumerate(right, start=1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1,
+                               previous[j - 1] + (a != b)))
+        if min(current) > limit:
+            return limit + 1
+        previous = current
+    return previous[-1]
+
+
+def _same_word(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if any(ch.isdigit() for ch in left + right):
+        return False
+    shorter = min(len(left), len(right))
+    if shorter < FUZZY_MIN_LENGTH:
+        return False
+    limit = 2 if shorter >= FUZZY_LONG_LENGTH else 1
+    return _edits(left, right, limit) <= limit
+
+
+def _pair_words(left: Sequence[str], right: Sequence[str]
+                ) -> tuple[list[tuple[str, str]], list[str], list[str]]:
+    """Pair up the words two names share; return the pairs and each side's leftovers."""
+    remaining = list(right)
+    shared: list[tuple[str, str]] = []
+    only_left: list[str] = []
+    for word in left:
+        if word in remaining:
+            remaining.remove(word)
+            shared.append((word, word))
+            continue
+        match = next((other for other in remaining if _same_word(word, other)), None)
+        if match is None:
+            only_left.append(word)
+        else:
+            remaining.remove(match)
+            shared.append((word, match))
+    return shared, only_left, remaining
+
+
+def generic_words(names: Sequence[Sequence[str]]) -> frozenset[str]:
+    """The words too common across these names to identify a product.
+
+    Counted over *distinct* names: the same product offered by five suppliers is one
+    name, and its model word must not become "generic" because it was repeated.
+    """
+    distinct = {tuple(words) for words in names}
+    if not distinct:
+        return frozenset()
+    counts: dict[str, int] = {}
+    for words in distinct:
+        for word in set(words):
+            counts[word] = counts.get(word, 0) + 1
+    floor = max(3, int(len(distinct) * GENERIC_SHARE))
+    return frozenset(word for word, count in counts.items() if count >= floor)
+
+
+def name_identity(left: Sequence[str], right: Sequence[str],
+                  generic: frozenset[str]) -> tuple[float | None, str]:
+    """``(score, "")`` when the two names name one product, else ``(None, why not)``."""
+    shared, only_left, only_right = _pair_words(left, right)
+    if not shared:
+        return None, "los nombres no comparten ninguna palabra"
+    if only_left and only_right:
+        return None, (f"cada nombre dice algo que el otro no: "
+                      f"{' '.join(only_left)} / {' '.join(only_right)}")
+    if not any(a not in generic or b not in generic for a, b in shared):
+        return None, "sólo comparten palabras genéricas"
+    score = len(shared) / (len(shared) + len(only_left) + len(only_right))
+    if score < IDENTITY_FLOOR:
+        return None, "un nombre contiene al otro pero dice mucho más; no alcanza para afirmarlo"
+    return score, ""
+
+
 @dataclass(frozen=True)
 class Candidate:
     item_key: str
     provider_key: str
     entry: CatalogEntry
     score: float
+    price: float | None = None
+    commission: dict | None = None
 
     @property
     def order(self) -> tuple:
-        # Best score first. On a tie the supplier's own row goes first: a supplier
-        # re-announcing its product is a stronger claim on that row than a stranger
-        # with an equally similar name. Then the two ids, so the order is total.
-        own = 0 if self.entry.provider_key == self.provider_key else 1
-        return (-self.score, own, self.item_key, self.entry.product_id)
+        # Best name match first. When two offers of this run name a catalog product
+        # equally well they are rivals for it, and R-026 settles rivals: the cheaper
+        # one, then the better commission. Then the ids, so the order is total.
+        return (
+            -self.score,
+            float("inf") if self.price is None else float(self.price),
+            -_compare.commission_score(self.commission),
+            self.item_key,
+            self.entry.product_id,
+        )
 
 
-def candidates_for(view: ProductView, entries: Sequence[CatalogEntry]
+def candidates_for(view: ProductView, entries: Sequence[CatalogEntry],
+                   generic: frozenset[str] = frozenset(),
                    ) -> tuple[list[Candidate], tuple[CatalogEntry, str] | None]:
     """Every catalog entry this product may be, plus the nearest one that was refused.
 
     The refused one is carried so that a product going back to the owner as new can say
     *which* published product it almost was and why it is not -- "no match" and "nearly
-    a match, different wattage" are different things for the person reading it.
+    a match, different model" are different things for the person reading it.
     """
+    words = identity_words(view.name)
+    add_ons = _compare.add_ons_in(view.name)
     accepted: list[Candidate] = []
     refused: tuple[float, CatalogEntry, str] | None = None
+
+    def refuse(closeness: float, entry: CatalogEntry, why: str) -> None:
+        nonlocal refused
+        if refused is None or closeness > refused[0]:
+            refused = (closeness, entry, why)
+
     for entry in entries:
-        score = similarity(view, entry)
-        if score < CATALOG_FLOOR:
+        score, why = name_identity(words, identity_words(entry.name), generic)
+        if score is None:
+            closeness = similarity(view, entry)
+            if closeness >= CATALOG_FLOOR:
+                refuse(closeness, entry, why)
+            continue
+        # R-025: an add-on announced in one name and not in the other is another product.
+        theirs = _compare.add_ons_in(entry.name)
+        if add_ons != theirs:
+            refuse(score, entry, "uno anuncia un aditamento que el otro no: "
+                                 f"{', '.join(sorted(set(add_ons) ^ set(theirs)))}")
             continue
         clash = identity_clash(view, entry)
         if clash is not None:
-            if refused is None or score > refused[0]:
-                refused = (score, entry, clash)
+            refuse(score, entry, clash)
             continue
-        accepted.append(Candidate(view.item_key, view.provider_key, entry, score))
+        accepted.append(Candidate(view.item_key, view.provider_key, entry, score,
+                                  view.price, view.commission))
     return accepted, (None if refused is None else (refused[1], refused[2]))
 
 
@@ -693,10 +853,13 @@ def confront(items: Sequence[Mapping[str, Any]], catalog: Sequence[CatalogEntry]
             raise ConfrontationRejected(f"item_key repetido en la entrada: {view.item_key}")
         views[view.item_key] = view
 
+    generic = generic_words([identity_words(view.name) for view in views.values()]
+                            + [identity_words(entry.name) for entry in catalog])
+
     pool: list[Candidate] = []
     nearest_refused: dict[str, tuple[CatalogEntry, str]] = {}
     for key in sorted(views):
-        accepted, refused = candidates_for(views[key], catalog)
+        accepted, refused = candidates_for(views[key], catalog, generic)
         pool.extend(accepted)
         if refused is not None:
             nearest_refused[key] = refused
@@ -724,12 +887,25 @@ def confront(items: Sequence[Mapping[str, Any]], catalog: Sequence[CatalogEntry]
             verdicts.append(decide(view, candidate.entry, candidate.score, now))
             continue
 
-        near: CatalogEntry | None = None
         if key in lost_to:
-            near, holder = lost_to[key]
-            detail = (f"el producto publicado más parecido («{near.name}») ya quedó "
-                      f"emparejado con otra oferta de esta corrida ({holder})")
-        elif key in nearest_refused:
+            # The product exists; another offer of this same run won the right to be
+            # compared with it. That is not a new product, and not a change either.
+            entry, holder = lost_to[key]
+            verdicts.append(
+                Verdict(
+                    item_key=view.item_key, provider_key=view.provider_key,
+                    disposition=EXISTENTE, reason=REASON_OUTBID, action=None,
+                    skip_reason=SKIP_CATALOG_KEPT, winner="catalog",
+                    detail=(f"otra oferta de esta corrida es mejor para «{entry.name}» "
+                            f"({holder})"),
+                    db_name=entry.name, db_provider_key=entry.provider_key,
+                    db_price=entry.price, near_product_id=entry.product_id,
+                )
+            )
+            continue
+
+        near: CatalogEntry | None = None
+        if key in nearest_refused:
             near, clash = nearest_refused[key]
             detail = f"parecido a «{near.name}» pero no es el mismo: {clash}"
         else:
@@ -811,6 +987,9 @@ __all__ = [
     "commission_of_row",
     "load_catalog",
     "similarity",
+    "identity_words",
+    "generic_words",
+    "name_identity",
     "specs_disagree",
     "identity_clash",
     "candidates_for",

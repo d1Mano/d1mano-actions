@@ -72,6 +72,7 @@ import re
 import sys
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -674,6 +675,7 @@ class ProductView:
     axes: tuple[Axis, ...]
     unanchored: tuple[str, ...]
     add_ons: tuple[str, ...]
+    observed_at: str = ""
     duplicate_of: str | None = None
 
     @property
@@ -790,6 +792,7 @@ def build_view(record: dict) -> ProductView:
         axes=tuple(axes),
         unanchored=tuple(unanchored),
         add_ons=add_ons_in(announced_scope(record)),
+        observed_at=str(record.get("observed_at") or ""),
     )
 
 
@@ -1504,24 +1507,56 @@ class Comparison:
         }
 
 
-def _dedupe_within_source(views: list[ProductView]) -> int:
-    """Mark literal repeats inside one vendor's own chat.
+def _announced_at(view: ProductView) -> float:
+    """When the announcement was made, as a number; 0 when the record carries none."""
+    if not view.observed_at:
+        return 0.0
+    try:
+        return datetime.fromisoformat(view.observed_at).timestamp()
+    except ValueError:
+        return 0.0
 
-    The legacy pipeline dropped 66 of 215 products in exactly this shape -- same name,
-    same price, same action, same target -- with no row, no warning and no
-    ``warnings_log``; the report read "149 decisiones (de 215 productos parseados)" and
-    "Avisos: (ninguno)". Here the collapse is explicit, the survivor is the earliest
-    ordinal so the choice replays, and every collapsed product leaves with the reason the
-    schema already has a value for.
+
+def _dedupe_within_source(views: list[ProductView]) -> int:
+    """One offer per product per supplier: the supplier's latest word, at its best price.
+
+    A supplier's chat repeats itself. The same product is re-posted in the afternoon at
+    a new price; one caption states two prices, each with its own commission. Those are
+    not several products and they are not a competition between suppliers -- they are
+    one supplier's offer, said more than once. Left in, the extra copies reach the
+    catalog stage as products with no counterpart and come back to the owner as "new".
+
+    Two announcements are the same product when the supplier gave them the same name and
+    the same add-ons (a variant "con extensor" is another product, and stays). Among
+    those, the survivor is:
+
+    * the **latest announcement** -- what a supplier says now replaces what it said this
+      morning, whether the price went down or up;
+    * and within one announcement, the **cheapest price** (R-026: price first), which
+      carries the commission that was stated with it.
+
+    Every collapsed product leaves with ``DUPLICATE_IN_SOURCE`` and the key of the one
+    that replaced it. Nothing is dropped without a row.
     """
-    first_seen: dict[tuple, str] = {}
+    groups: dict[tuple, list[ProductView]] = {}
+    for view in views:
+        groups.setdefault((view.provider_key, view.normalized_name, view.add_ons), []).append(view)
+
     duplicates = 0
-    for view in sorted(views, key=lambda item: (item.provider_key, item.ordinal)):
-        key = view.fingerprint
-        survivor = first_seen.setdefault(key, view.item_key)
-        if survivor != view.item_key:
-            view.duplicate_of = survivor
-            duplicates += 1
+    for key in sorted(groups, key=lambda k: (k[0], k[1], k[2])):
+        members = groups[key]
+        if len(members) < 2:
+            continue
+        survivor = min(
+            members,
+            key=lambda v: (-_announced_at(v),
+                           float("inf") if v.price is None else float(v.price),
+                           v.ordinal),
+        )
+        for view in members:
+            if view is not survivor:
+                view.duplicate_of = survivor.item_key
+                duplicates += 1
     return duplicates
 
 

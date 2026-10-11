@@ -39,6 +39,7 @@ import hashlib
 import json
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -248,13 +249,14 @@ def _spec_lines(text: str, commission: dict | None) -> list[dict]:
     catalogue loaded; splitting it here would mean embedding one.
     """
     out: list[dict] = []
+    bare = whatsapp.uses_bare_prices(text)
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
-        if whatsapp.PRICE_LINE.search(line):
+        if whatsapp.is_price_line(line, bare):
             continue
-        if commission and whatsapp.COMMISSION_LINE.search(line):
+        if whatsapp.COMMISSION_LINE.search(line):
             continue
         cleaned = whatsapp.clean_name(stripped)
         if len(cleaned) < 3:
@@ -295,7 +297,7 @@ def _expand_variants(message: whatsapp.Message, provider_key: str) -> list[dict]
                 "name": base_name,
                 "price": chosen["value"],
                 "prices": [_tagged_price(chosen, provider_key)],
-                "commission": commission,
+                "commission": chosen.get("commission") or commission,
             }
         )
         return variants
@@ -314,7 +316,9 @@ def _expand_variants(message: whatsapp.Message, provider_key: str) -> list[dict]
                 "name": f"{base_name}{suffix}" if suffix else base_name,
                 "price": price["value"],
                 "prices": [_tagged_price(price, provider_key)],
-                "commission": commission,
+                # Each price carries the commission stated with it; the caption-wide
+                # one is only the fallback for a price that states none of its own.
+                "commission": price.get("commission") or commission,
             }
         )
     return variants
@@ -335,6 +339,7 @@ def ingest_source(
     slot: int,
     work_dir: Path,
     zone: ZoneInfo,
+    reference: datetime | None = None,
 ) -> tuple[list[dict], SourceReport]:
     """Ingest one chat into records carrying their ordinals, signatures and tags.
 
@@ -353,7 +358,8 @@ def ingest_source(
             f"source {spec.provider_key}: no WhatsApp timestamp found in "
             f"{chat.declared_bytes} bytes; the upload is not a chat export"
         )
-    order = dates.resolve_order(stamps)
+    local_reference = None if reference is None else reference.astimezone(zone)
+    order = dates.resolve_order(stamps, local_reference)
 
     messages = whatsapp.parse_messages(chat.path)
     # The ordinal primitive and the record are built together and travel as a pair:
@@ -366,9 +372,9 @@ def ingest_source(
             # An attachment-only message announces nothing. It is not a product and
             # not a variant of one, so it does not consume a variant index either.
             continue
-        if not whatsapp.PRICE_LINE.search(message.text):
+        if not whatsapp.has_price(message.text):
             continue
-        observed_at = dates.localize(message.stamp, order.order, zone)
+        observed_at = dates.localize(message.stamp, order.order, zone, reference)
         for variant_index, variant in enumerate(_expand_variants(message, spec.provider_key)):
             paired.append(
                 (
@@ -466,9 +472,22 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=f"overrides the run's effective_tz (default: the manifest's, else {limits.DEFAULT_EFFECTIVE_TZ})",
     )
+    parser.add_argument(
+        "--reference",
+        default=None,
+        help="ISO instant the run was created at; dates a pasted message that carries no "
+             "year (default: the manifest's reference_at)",
+    )
     args = parser.parse_args(argv)
 
     manifest = json.loads(Path(args.sources).read_text(encoding="utf-8"))
+    reference_text = args.reference or manifest.get("reference_at")
+    reference = None
+    if reference_text:
+        reference = datetime.fromisoformat(str(reference_text).replace("Z", "+00:00"))
+        if reference.tzinfo is None:
+            print("reference instant carries no zone", file=sys.stderr)
+            return 2
     raw_sources = manifest.get("sources") or []
     if not raw_sources:
         print("manifest declares no sources", file=sys.stderr)
@@ -495,7 +514,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         zone = dates.load_zone(zone_name)
         for slot, spec in enumerate(specs):
-            records, report = ingest_source(spec, slot, work_dir, zone)
+            records, report = ingest_source(spec, slot, work_dir, zone, reference)
             all_records.extend(records)
             reports.append(report)
             print(
