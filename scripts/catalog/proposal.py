@@ -90,12 +90,27 @@ DETAILS_MAX = 500
 _NAMESPACE = uuid.UUID("6f0a1c1e-7f0b-4c38-9b7e-0c8d4a2d51aa")
 
 
+# "Transporte" and "mensajería" are also things a vehicle is *for*: "ideal para
+# recorridos urbanos, mensajería y uso diario" describes the product, not the deal. So
+# those two words state a term only next to a word that makes it one.
+_TRANSPORT_BARE = re.compile(r"\btranspor?t[ea]\b|\bmensajeri[ao]\b")
+_TRANSPORT_TERM = re.compile(
+    r"\binclu\w*|\bgratis\b|\badicional\b|\bdomicilio\b|\bentregas?\b|\benvios?\b"
+    r"|\bdelivery\b|\brecog\w*|\breparto\b|\bbuscan?\b|\bhabana\b|\bartemisa\b"
+    r"|\bprovincias?\b|\bcosto\b|\bpaga\b|\bsin\b|\bcon\b")
+
+
 def classify(text: str) -> str | None:
     """Which kind of commercial term a line states, or ``None`` when it states none."""
     folded = _compare.fold_text(text)
     for kind in KINDS:
-        if _KIND_PATTERNS[kind].search(folded):
-            return kind
+        if not _KIND_PATTERNS[kind].search(folded):
+            continue
+        if kind == TRANSPORT:
+            rest = _TRANSPORT_BARE.sub(" ", folded).strip()
+            if _TRANSPORT_BARE.search(folded) and rest and not _TRANSPORT_TERM.search(folded):
+                continue
+        return kind
     return None
 
 

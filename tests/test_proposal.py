@@ -37,6 +37,13 @@ class Classify(unittest.TestCase):
         self.assertIsNone(proposal.classify("- transfer automático"))
         self.assertIsNone(proposal.classify("⛽️ EXTENSOR DE RANGO MECÁNICO DE 4500 WATTS"))
 
+    def test_what_a_vehicle_is_for_is_not_a_delivery_term(self):
+        self.assertIsNone(proposal.classify("Ideal para recorridos urbanos, mensajería y uso diario"))
+        self.assertEqual(proposal.classify("Mensajeria Habana Artemisa"), "transport")
+        self.assertEqual(proposal.classify("CON MENSAJERIA INCLUIDA"), "transport")
+        self.assertEqual(proposal.classify("🚛 Domicilio incluido en la Habana"), "transport")
+        self.assertEqual(proposal.classify("TRANSPORTE"), "transport")
+
     def test_text_drops_decoration_and_the_announcing_label(self):
         self.assertEqual(proposal.term_text("warranty", "🔧GARANTÍA: 15 DÍAS"), "15 días")
         self.assertEqual(proposal.term_text("transport", "🚛TRANSPORTE INCLUIDO"), "Incluido")
