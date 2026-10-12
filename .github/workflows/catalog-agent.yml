@@ -81,8 +81,8 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           # Cadena de modelos: cada lote prueba el siguiente si el anterior no responde.
-          # Van por el proveedor `opencode/` (el endpoint oficial); por `inhouse/` el
-          # servicio gratuito rechaza la llamada.
+          # Van por el proveedor `opencode/`, el que trae el CLI: no hay modelos
+          # declarados a mano en este repo.
           CATALOG_MODELS: ${{ vars.CATALOG_MODELS || 'opencode/mimo-v2.6-flash-free,opencode/big-pickle' }}
         run: |
           install -d -m 755 "$RUN_DIR"

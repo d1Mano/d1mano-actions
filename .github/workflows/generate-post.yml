@@ -9,7 +9,7 @@ name: generate-post
 # Flujo:
 #   1. Lee el brief congelado del post (boceto_posts.brief) + la fila
 #      con service role (Supabase REST, pasa RLS).
-#   2. OpenCode CLI con modelos FREE de Zen (inhouse/…) redacta la
+#   2. OpenCode CLI con modelos FREE de Zen (opencode/…) redacta la
 #      publicación en JSON (title/body/cta/hashtags).
 #   3. Escribe caption/blocks/status DIRECTAMENTE en boceto_posts
 #      (service role pasa RLS — mismo patrón que agent_tasks).
@@ -19,7 +19,7 @@ name: generate-post
 #   SUPABASE_SERVICE_ROLE → service role key (NUNCA anon)
 #   POST_MODEL            → (opcional, vars) modelo; default mimo-v2.6-flash-free.
 #
-# Generación: OpenCode CLI con modelos FREE de Zen (inhouse/…) — mismo
+# Generación: OpenCode CLI con modelos FREE de Zen (opencode/…) — mismo
 # patrón que process-task.yml, pero en repo público (sin límite mensual
 # del repo privado). Sin APIs de OpenRouter/Groq (flujo legacy).
 # ─────────────────────────────────────────────────────────────
