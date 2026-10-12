@@ -64,8 +64,14 @@ fail() {
 # recibe las URLs resueltas para tejerlas en la publicación según el
 # tipo de poster; lo que la DB no resuelve, no se menciona.
 BASE_URL="${POST_PUBLIC_BASE:-https://d1mano.github.io/earlyaccess}"
-# La app usa HashRouter: las rutas van tras '#'. Sin el #, el link no resuelve.
-DEEP_BASE="${BASE_URL}/#"
+# Links PARA COMPARTIR: apuntan a la página de vista previa del recurso
+# ({base}/s/catalog/…/), no a la ruta con '#'. Las redes y apps de
+# mensajería no reciben lo que va tras el '#', así que un link con hash
+# siempre mostraba la imagen genérica de la plataforma. La página de vista
+# previa trae la foto, el título y el precio, y al abrirse salta a la app.
+# Misma regla que src/shared/utils/deep-links.ts y el bot de Telegram.
+# La barra final es parte del link (evita una redirección del hosting).
+DEEP_BASE="${BASE_URL}/s"
 
 # Solo ids uuid reales: ids de prueba/legacy tumban la RPC con 400.
 UUIDS=$(echo "$BRIEF" | jq -r '[.products[].product.id // empty]
@@ -80,8 +86,8 @@ if [ -n "$UUIDS" ]; then
         -H "Content-Type: application/json" -d "{\"p_product_ids\": $ID_LIST}" || echo '[]')
   LINKS=$(echo "$BR" | jq -c --arg base "$DEEP_BASE" '{
     catalog: ([.[] | {b: .business_slug, br: .branch_slug, c: .catalog_slug}] | .[0] |
-      if . == null then null else "\($base)/catalog/\(.b)/\(.br)/\(.c)" end),
-    products: ([.[] | "\($base)/catalog/\(.business_slug)/\(.branch_slug)/\(.catalog_slug)/product/\(.product_slug)"] | unique)
+      if . == null then null else "\($base)/catalog/\(.b)/\(.br)/\(.c)/" end),
+    products: ([.[] | "\($base)/catalog/\(.business_slug)/\(.branch_slug)/\(.catalog_slug)/product/\(.product_slug)/"] | unique)
   }' 2>/dev/null) || LINKS='null'
   # Contacto: teléfono de la sucursal canónica (regla migración 16) del
   # primer producto resuelto. Sin links no hay contacto que buscar.
